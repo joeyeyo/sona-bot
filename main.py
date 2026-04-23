@@ -1,15 +1,26 @@
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
 from twilio.rest import Client
 from twilio.twiml.messaging_response import MessagingResponse
 import anthropic
 import os
 import json
+import httpx
 from datetime import datetime
 
 app = FastAPI()
 
-# ── clients ──────────────────────────────────────────────────────────────────
+# ── CORS (allow sona-frontend on Vercel to call this backend) ─────────────────
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://sona-frontend-lyart.vercel.app", "http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── clients ───────────────────────────────────────────────────────────────────
 twilio_client = Client(
     os.environ["TWILIO_ACCOUNT_SID"],
     os.environ["TWILIO_AUTH_TOKEN"],
@@ -17,9 +28,9 @@ twilio_client = Client(
 anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 TWILIO_WHATSAPP_NUMBER = os.environ.get("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
+YELP_API_KEY = os.environ.get("YELP_API_KEY", "")
 
-# ── in-memory conversation store (replace with DB later) ─────────────────────
-# Structure: { phone_number: { "messages": [...], "profile": {...} } }
+# ── in-memory conversation store (replace with DB later) ──────────────────────
 conversations: dict = {}
 
 # ── Sona system prompt ────────────────────────────────────────────────────────
@@ -66,11 +77,8 @@ def get_or_create_session(phone: str) -> dict:
 
 def chat_with_sona(phone: str, user_message: str) -> str:
     session = get_or_create_session(phone)
-
-    # Append user message
     session["messages"].append({"role": "user", "content": user_message})
 
-    # Call Claude
     response = anthropic_client.messages.create(
         model="claude-opus-4-5",
         max_tokens=500,
@@ -79,15 +87,11 @@ def chat_with_sona(phone: str, user_message: str) -> str:
     )
 
     reply = response.content[0].text
-
-    # Append assistant message
     session["messages"].append({"role": "assistant", "content": reply})
-
     return reply
 
 
 def send_whatsapp_message(to: str, body: str):
-    """Proactively send a message (for match intros, event reminders, etc.)"""
     twilio_client.messages.create(
         from_=TWILIO_WHATSAPP_NUMBER,
         body=body,
@@ -101,25 +105,121 @@ async def webhook(
     From: str = Form(...),
     Body: str = Form(...),
 ):
-    phone = From  # e.g. "whatsapp:+16263756580"
+    phone = From
     user_message = Body.strip()
-
     print(f"[{phone}] → {user_message}")
-
     reply = chat_with_sona(phone, user_message)
-
     print(f"[Sona → {phone}] {reply}")
-
-    # Reply via TwiML
     resp = MessagingResponse()
     resp.message(reply)
     return str(resp)
 
 
+# ── vendor search endpoint ────────────────────────────────────────────────────
+@app.post("/search-vendors")
+async def search_vendors(payload: dict):
+    """
+    Search for vendors via Yelp based on event requirements.
+    POST body: {
+        "category": "caterers",          // e.g. caterers, photographers, venues
+        "location": "Los Angeles, CA",
+        "budget": 600,                   // max budget in dollars
+        "guest_count": 50,
+        "min_rating": 4.25,
+        "keywords": "asian food"         // optional extra search terms
+    }
+    """
+    category = payload.get("category", "caterers")
+    location = payload.get("location", "Los Angeles, CA")
+    budget = payload.get("budget")
+    guest_count = payload.get("guest_count")
+    min_rating = payload.get("min_rating", 4.0)
+    keywords = payload.get("keywords", "")
+
+    search_term = f"{keywords} {category}".strip()
+
+    # Call Yelp Fusion API
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            "https://api.yelp.com/v3/businesses/search",
+            headers={"Authorization": f"Bearer {YELP_API_KEY}"},
+            params={
+                "term": search_term,
+                "location": location,
+                "limit": 20,
+                "sort_by": "rating",
+            },
+        )
+
+    if response.status_code != 200:
+        return {"error": "Yelp API error", "detail": response.text}
+
+    data = response.json()
+    businesses = data.get("businesses", [])
+
+    # Filter by minimum rating
+    filtered = [b for b in businesses if b.get("rating", 0) >= min_rating]
+
+    # Shape the response for the frontend
+    vendors = []
+    for b in filtered:
+        vendors.append({
+            "id": b.get("id"),
+            "name": b.get("name"),
+            "rating": b.get("rating"),
+            "review_count": b.get("review_count"),
+            "price": b.get("price", "N/A"),
+            "phone": b.get("display_phone", "N/A"),
+            "address": ", ".join(b.get("location", {}).get("display_address", [])),
+            "url": b.get("url"),
+            "image_url": b.get("image_url"),
+            "categories": [c["title"] for c in b.get("categories", [])],
+        })
+
+    # Use Claude to rank and summarize the best matches given the budget + guest count
+    if vendors:
+        summary_prompt = f"""I'm looking for {category} for an event with {guest_count} guests, budget under ${budget}.
+Here are the Yelp results: {json.dumps(vendors[:10], indent=2)}
+
+Pick the top 5 best matches and for each one write a 1-sentence reason why they're a good fit.
+Respond ONLY with a JSON array like:
+[{{"id": "...", "reason": "..."}}]
+No markdown, no explanation, just the JSON array."""
+
+        claude_response = anthropic_client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=500,
+            messages=[{"role": "user", "content": summary_prompt}],
+        )
+
+        try:
+            rankings = json.loads(claude_response.content[0].text)
+            ranked_ids = {r["id"]: r["reason"] for r in rankings}
+
+            # Merge Claude's reasons into vendor list and sort
+            for v in vendors:
+                v["ai_reason"] = ranked_ids.get(v["id"], "")
+
+            vendors = sorted(vendors, key=lambda v: 1 if v["ai_reason"] else 0, reverse=True)
+        except Exception:
+            pass  # If Claude parsing fails, just return raw Yelp results
+
+    return {
+        "vendors": vendors,
+        "total": len(vendors),
+        "query": {
+            "category": category,
+            "location": location,
+            "budget": budget,
+            "guest_count": guest_count,
+            "min_rating": min_rating,
+        }
+    }
+
+
 # ── admin endpoints ───────────────────────────────────────────────────────────
 @app.get("/admin/users")
 async def list_users():
-    """See all users and their profiles"""
     return {
         phone: {
             "joined_at": data["joined_at"],
@@ -132,24 +232,12 @@ async def list_users():
 
 @app.get("/admin/conversation/{phone_number}")
 async def get_conversation(phone_number: str):
-    """Read full conversation for a user (encode + as %2B in URL)"""
     key = f"whatsapp:+{phone_number}"
     return conversations.get(key, {"error": "not found"})
 
 
 @app.post("/admin/introduce")
 async def introduce_two_people(payload: dict):
-    """
-    Manually trigger a match introduction.
-    POST body: {
-        "phone_a": "+16263756580",
-        "phone_b": "+447911123456",
-        "name_a": "Joe",
-        "name_b": "Sarah",
-        "reason": "You're both building in the health tech space and Sarah is looking for a technical co-founder",
-        "icebreaker": "Ask her about her time at Stanford — she has great stories"
-    }
-    """
     phone_a = f"whatsapp:{payload['phone_a']}"
     phone_b = f"whatsapp:{payload['phone_b']}"
 
@@ -172,16 +260,6 @@ async def introduce_two_people(payload: dict):
 
 @app.post("/admin/event-reminder")
 async def send_event_reminder(payload: dict):
-    """
-    Send event reminder to all users or specific ones.
-    POST body: {
-        "phones": ["+16263756580"],   // omit to send to all
-        "event_name": "Sona Social #1",
-        "date": "Saturday April 19th",
-        "time": "7pm",
-        "location": "The Lobby, Taipei"
-    }
-    """
     phones = payload.get("phones")
     if not phones:
         phones = [p.replace("whatsapp:", "") for p in conversations.keys()]

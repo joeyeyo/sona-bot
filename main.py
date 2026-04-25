@@ -10,6 +10,7 @@ import httpx
 import re
 from datetime import datetime
 from statistics import mean
+from urllib.parse import quote_plus, unquote, urlparse
 
 app = FastAPI()
 
@@ -101,11 +102,6 @@ def send_whatsapp_message(to: str, body: str):
 
 # ── vendor ranking ────────────────────────────────────────────────────────────
 def bayesian_score(rating: float, review_count: int, mean_rating: float, C: int = 50) -> float:
-    """
-    Bayesian average — blends vendor rating with global mean.
-    Vendors with few reviews get pulled toward the mean.
-    C = how many reviews needed to fully trust a rating.
-    """
     return (C * mean_rating + rating * review_count) / (C + review_count)
 
 
@@ -116,135 +112,164 @@ def rank_vendors(vendors: list, search_params: dict) -> list:
     ratings = [v.get("rating", 0) for v in vendors if v.get("rating")]
     mean_rating = mean(ratings) if ratings else 4.5
     keyword = search_params.get("keywords", "").lower()
-
     price_boosts = {"$": 1.0, "$$": 0.9, "$$$": 0.7, "$$$$": 0.5}
 
     for v in vendors:
-        # Step 1: Bayesian base score
-        b_score = bayesian_score(
-            v.get("rating", 0),
-            v.get("review_count", 0),
-            mean_rating,
-        )
-
-        # Step 2: Price boost
-        price = v.get("price", "N/A")
-        price_boost = price_boosts.get(price, 0.85)
-
-        # Step 3: Keyword boost — does vendor name contain search keywords?
+        b_score = bayesian_score(v.get("rating", 0), v.get("review_count", 0), mean_rating)
+        price_boost = price_boosts.get(v.get("price", "N/A"), 0.85)
         keyword_boost = 1.1 if keyword and keyword in v.get("name", "").lower() else 1.0
-
-        # Step 4: Review volume boost — reward vendors with lots of reviews
-        review_boost = 1.0
         n = v.get("review_count", 0)
-        if n >= 200:
-            review_boost = 1.05
-        elif n >= 100:
-            review_boost = 1.02
-
-        # Step 5: Email found boost — reward vendors we found contact info for
+        review_boost = 1.05 if n >= 200 else (1.02 if n >= 100 else 1.0)
         email_boost = 1.05 if v.get("email") else 1.0
-
         v["score"] = round(b_score * price_boost * keyword_boost * review_boost * email_boost, 4)
 
     return sorted(vendors, key=lambda v: v["score"], reverse=True)
 
 
-# ── email scraper ─────────────────────────────────────────────────────────────
+# ── email finding via Google search ───────────────────────────────────────────
+
+EMAIL_PATTERN = re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b')
+
+IGNORE_DOMAINS = {
+    "sentry.io", "wixpress.com", "squarespace.com", "wordpress.com",
+    "shopify.com", "example.com", "yourdomain.com", "email.com",
+    "google.com", "gmail.com", "yahoo.com", "hotmail.com", "outlook.com",
+    "yelp.com", "facebook.com", "instagram.com", "twitter.com",
+    "png", "jpg", "jpeg", "gif", "webp", "svg",
+}
+
+PRIORITY_LOCAL_PARTS = ["contact", "info", "hello", "events", "booking", "catering", "hire", "enquir", "inquir"]
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+}
+
+
+def extract_emails_from_text(text: str) -> list[str]:
+    """Extract and clean emails from raw HTML/text."""
+    # Prioritize mailto: links
+    mailto = re.findall(r'mailto:([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})', text)
+    plain = EMAIL_PATTERN.findall(text)
+    all_emails = mailto + plain
+
+    clean = []
+    seen = set()
+    for email in all_emails:
+        email = email.lower().strip().rstrip(".,;")
+        domain = email.split("@")[-1]
+        if domain not in IGNORE_DOMAINS and email not in seen and len(email) < 80:
+            seen.add(email)
+            clean.append(email)
+
+    # Sort: priority keywords first
+    def priority(e):
+        local = e.split("@")[0]
+        return 0 if any(kw in local for kw in PRIORITY_LOCAL_PARTS) else 1
+
+    return sorted(clean, key=priority)
+
+
+async def google_search_for_website(vendor_name: str, address: str) -> str | None:
+    """
+    Google search: '"Vendor Name" "City" contact email site'
+    Extract the first non-Yelp, non-social result URL as their website.
+    """
+    city = address.split(",")[-2].strip() if "," in address else ""
+    query = f'"{vendor_name}" {city} official website'
+    url = f"https://www.google.com/search?q={quote_plus(query)}&num=5"
+
+    skip_domains = {"yelp.com", "facebook.com", "instagram.com", "twitter.com",
+                    "doordash.com", "grubhub.com", "ubereats.com", "tripadvisor.com",
+                    "yellowpages.com", "bbb.org", "google.com"}
+
+    try:
+        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+            resp = await client.get(url, headers=HEADERS)
+            if resp.status_code != 200:
+                return None
+
+            text = resp.text
+
+            # Extract URLs from Google result links
+            # Google wraps results in /url?q=... redirects
+            raw_links = re.findall(r'/url\?q=(https?://[^&"]+)', text)
+            for link in raw_links:
+                link = unquote(link)
+                domain = urlparse(link).netloc.replace("www.", "")
+                if not any(skip in domain for skip in skip_domains):
+                    # Looks like a real business website
+                    return link.split("?")[0].rstrip("/")
+    except Exception:
+        pass
+    return None
+
+
+async def google_search_for_email(vendor_name: str, address: str) -> str | None:
+    """
+    Google search: '"Vendor Name" "City" email contact
+    Look for email patterns directly in the search result snippets.
+    """
+    city = address.split(",")[-2].strip() if "," in address else ""
+    query = f'"{vendor_name}" {city} email contact'
+    url = f"https://www.google.com/search?q={quote_plus(query)}&num=5"
+
+    try:
+        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+            resp = await client.get(url, headers=HEADERS)
+            if resp.status_code != 200:
+                return None
+
+            emails = extract_emails_from_text(resp.text)
+            # Filter out Google's own emails and generic ones
+            filtered = [e for e in emails if "google" not in e and "example" not in e]
+            return filtered[0] if filtered else None
+    except Exception:
+        return None
+
+
 async def scrape_email_from_website(website_url: str) -> str | None:
-    """
-    Visit a business website and look for email addresses.
-    Checks homepage, /contact, and /about pages.
-    """
+    """Visit a business website and scrape for contact emails."""
     if not website_url:
         return None
 
-    email_pattern = re.compile(
-        r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b'
-    )
-
-    # Domains to ignore (privacy/legal emails, not contact emails)
-    ignore_domains = {
-        "sentry.io", "wixpress.com", "squarespace.com", "wordpress.com",
-        "shopify.com", "example.com", "yourdomain.com", "email.com",
-    }
-
-    # Pages to check
     base = website_url.rstrip("/")
     pages_to_check = [base, f"{base}/contact", f"{base}/contact-us", f"{base}/about"]
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-
-    found_emails = []
 
     async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
         for page_url in pages_to_check:
             try:
-                response = await client.get(page_url, headers=headers)
-                if response.status_code == 200:
-                    text = response.text
-
-                    # Find mailto: links first (most reliable)
-                    mailto_matches = re.findall(r'mailto:([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})', text)
-                    found_emails.extend(mailto_matches)
-
-                    # Also find plain email patterns
-                    plain_matches = email_pattern.findall(text)
-                    found_emails.extend(plain_matches)
-
-                    if found_emails:
-                        break  # Stop once we find emails on a page
+                resp = await client.get(page_url, headers=HEADERS)
+                if resp.status_code == 200:
+                    emails = extract_emails_from_text(resp.text)
+                    if emails:
+                        return emails[0]
             except Exception:
                 continue
-
-    # Filter and deduplicate
-    clean_emails = []
-    seen = set()
-    for email in found_emails:
-        email = email.lower().strip()
-        domain = email.split("@")[-1]
-        if domain not in ignore_domains and email not in seen:
-            seen.add(email)
-            clean_emails.append(email)
-
-    # Prefer emails with contact/info/events/booking keywords
-    priority_keywords = ["contact", "info", "hello", "events", "booking", "catering", "hire"]
-    for email in clean_emails:
-        local = email.split("@")[0]
-        if any(kw in local for kw in priority_keywords):
-            return email
-
-    # Otherwise return first found
-    return clean_emails[0] if clean_emails else None
-
-
-async def get_website_from_yelp_page(yelp_url: str) -> str | None:
-    """
-    Visit a Yelp business page and extract their website URL.
-    """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-    }
-    try:
-        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
-            response = await client.get(yelp_url, headers=headers)
-            if response.status_code == 200:
-                # Look for website link pattern in Yelp page
-                matches = re.findall(
-                    r'href="https://www\.yelp\.com/biz_redir\?url=([^"&]+)',
-                    response.text
-                )
-                if matches:
-                    from urllib.parse import unquote
-                    website = unquote(matches[0])
-                    # Clean up any tracking params
-                    website = website.split("?")[0]
-                    return website
-    except Exception:
-        pass
     return None
+
+
+async def find_vendor_email(vendor_name: str, address: str) -> tuple[str | None, str | None]:
+    """
+    Multi-strategy email finder. Returns (email, website).
+
+    Strategy:
+    1. Google search result snippets for email directly
+    2. Google search for their website, then scrape it
+    """
+    # Strategy 1: Look for email directly in Google search snippets
+    email = await google_search_for_email(vendor_name, address)
+    if email:
+        return email, None
+
+    # Strategy 2: Find their website via Google, then scrape it
+    website = await google_search_for_website(vendor_name, address)
+    if website:
+        email = await scrape_email_from_website(website)
+        return email, website
+
+    return None, None
 
 
 # ── webhook endpoint ──────────────────────────────────────────────────────────
@@ -267,15 +292,7 @@ async def webhook(
 @app.post("/search-vendors")
 async def search_vendors(payload: dict):
     """
-    Search for vendors via Yelp, scrape emails, and rank results.
-    POST body: {
-        "category": "caterers",
-        "location": "Los Angeles, CA",
-        "budget": 600,
-        "guest_count": 50,
-        "min_rating": 4.25,
-        "keywords": "asian food"
-    }
+    Search Yelp, enrich with emails via Google search, rank with Bayesian algorithm.
     """
     category = payload.get("category", "caterers")
     location = payload.get("location", "Los Angeles, CA")
@@ -304,11 +321,9 @@ async def search_vendors(payload: dict):
         return {"error": "Yelp API error", "detail": response.text}
 
     businesses = response.json().get("businesses", [])
-
-    # Step 2: Filter by minimum rating
     filtered = [b for b in businesses if b.get("rating", 0) >= min_rating]
 
-    # Step 3: Shape the data
+    # Step 2: Shape data
     vendors = []
     for b in filtered:
         vendors.append({
@@ -327,34 +342,32 @@ async def search_vendors(payload: dict):
             "website": None,
         })
 
-    # Step 4: Scrape emails (top 10 only to keep it fast)
+    # Step 3: Find emails via Google search (top 10 only for speed)
     if scrape_emails and vendors:
         import asyncio
 
         async def enrich_vendor(vendor):
             try:
-                # Try to get website from Yelp page
-                website = await get_website_from_yelp_page(vendor["url"])
-                if website:
-                    vendor["website"] = website
-                    email = await scrape_email_from_website(website)
-                    vendor["email"] = email
-            except Exception:
-                pass
+                email, website = await find_vendor_email(vendor["name"], vendor["address"])
+                vendor["email"] = email
+                vendor["website"] = website
+                print(f"[email] {vendor['name']} → {email or 'not found'} | site: {website or 'not found'}")
+            except Exception as e:
+                print(f"[email error] {vendor['name']}: {e}")
             return vendor
 
-        # Run email scraping concurrently for top 10 vendors
-        top_vendors = vendors[:10]
-        rest_vendors = vendors[10:]
-        enriched = await asyncio.gather(*[enrich_vendor(v) for v in top_vendors])
-        vendors = list(enriched) + rest_vendors
+        top = vendors[:10]
+        rest = vendors[10:]
+        enriched = await asyncio.gather(*[enrich_vendor(v) for v in top])
+        vendors = list(enriched) + rest
 
-    # Step 5: Rank with Bayesian algorithm
+    # Step 4: Bayesian ranking
     vendors = rank_vendors(vendors, {"keywords": keywords})
 
-    # Step 6: Claude AI reasons for top 5
+    # Step 5: Claude AI reasons for top 5
     if vendors:
-        summary_prompt = f"""I'm looking for {category} for an event with {guest_count} guests, budget under ${budget}.
+        try:
+            summary_prompt = f"""I'm looking for {category} for an event with {guest_count} guests, budget under ${budget}.
 Here are the top vendors: {json.dumps([{
     "id": v["id"], "name": v["name"], "rating": v["rating"],
     "review_count": v["review_count"], "price": v["price"],
@@ -365,7 +378,6 @@ For each vendor write a 1-sentence reason why they're a good fit for this event.
 Respond ONLY with a JSON array: [{{"id": "...", "reason": "..."}}]
 No markdown, no explanation."""
 
-        try:
             claude_response = anthropic_client.messages.create(
                 model="claude-opus-4-5",
                 max_tokens=500,
@@ -415,21 +427,10 @@ async def get_conversation(phone_number: str):
 async def introduce_two_people(payload: dict):
     phone_a = f"whatsapp:{payload['phone_a']}"
     phone_b = f"whatsapp:{payload['phone_b']}"
-
-    msg_to_a = (
-        f"Hey! I've been thinking about you and I have someone you should meet. "
-        f"{payload['name_b']} — {payload['reason']}. "
-        f"Tip: {payload['icebreaker']} 🎯"
-    )
-    msg_to_b = (
-        f"Hey! I want to introduce you to someone. "
-        f"{payload['name_a']} — {payload['reason']}. "
-        f"Tip: {payload['icebreaker']} 🎯"
-    )
-
+    msg_to_a = (f"Hey! I've been thinking about you and I have someone you should meet. {payload['name_b']} — {payload['reason']}. Tip: {payload['icebreaker']} 🎯")
+    msg_to_b = (f"Hey! I want to introduce you to someone. {payload['name_a']} — {payload['reason']}. Tip: {payload['icebreaker']} 🎯")
     send_whatsapp_message(phone_a, msg_to_a)
     send_whatsapp_message(phone_b, msg_to_b)
-
     return {"status": "sent", "to": [phone_a, phone_b]}
 
 
@@ -438,15 +439,9 @@ async def send_event_reminder(payload: dict):
     phones = payload.get("phones")
     if not phones:
         phones = [p.replace("whatsapp:", "") for p in conversations.keys()]
-
-    msg = (
-        f"🗓 Reminder: {payload['event_name']} is happening {payload['date']} at {payload['time']}! "
-        f"Come to {payload['location']}. I'll send you a heads-up on who to look out for before the night. See you there!"
-    )
-
+    msg = (f"🗓 Reminder: {payload['event_name']} is happening {payload['date']} at {payload['time']}! Come to {payload['location']}. I'll send you a heads-up on who to look out for before the night. See you there!")
     for phone in phones:
         send_whatsapp_message(f"whatsapp:{phone}", msg)
-
     return {"status": "sent", "count": len(phones)}
 
 

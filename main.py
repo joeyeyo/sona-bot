@@ -108,12 +108,10 @@ def bayesian_score(rating: float, review_count: int, mean_rating: float, C: int 
 def rank_vendors(vendors: list, search_params: dict) -> list:
     if not vendors:
         return vendors
-
     ratings = [v.get("rating", 0) for v in vendors if v.get("rating")]
     mean_rating = mean(ratings) if ratings else 4.5
     keyword = search_params.get("keywords", "").lower()
     price_boosts = {"$": 1.0, "$$": 0.9, "$$$": 0.7, "$$$$": 0.5}
-
     for v in vendors:
         b_score = bayesian_score(v.get("rating", 0), v.get("review_count", 0), mean_rating)
         price_boost = price_boosts.get(v.get("price", "N/A"), 0.85)
@@ -122,12 +120,10 @@ def rank_vendors(vendors: list, search_params: dict) -> list:
         review_boost = 1.05 if n >= 200 else (1.02 if n >= 100 else 1.0)
         email_boost = 1.05 if v.get("email") else 1.0
         v["score"] = round(b_score * price_boost * keyword_boost * review_boost * email_boost, 4)
-
     return sorted(vendors, key=lambda v: v["score"], reverse=True)
 
 
-# ── email finding via Google search ───────────────────────────────────────────
-
+# ── email finding ─────────────────────────────────────────────────────────────
 EMAIL_PATTERN = re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b')
 
 IGNORE_DOMAINS = {
@@ -147,13 +143,10 @@ HEADERS = {
 }
 
 
-def extract_emails_from_text(text: str) -> list[str]:
-    """Extract and clean emails from raw HTML/text."""
-    # Prioritize mailto: links
+def extract_emails_from_text(text: str) -> list:
     mailto = re.findall(r'mailto:([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})', text)
     plain = EMAIL_PATTERN.findall(text)
     all_emails = mailto + plain
-
     clean = []
     seen = set()
     for email in all_emails:
@@ -163,7 +156,6 @@ def extract_emails_from_text(text: str) -> list[str]:
             seen.add(email)
             clean.append(email)
 
-    # Sort: priority keywords first
     def priority(e):
         local = e.split("@")[0]
         return 0 if any(kw in local for kw in PRIORITY_LOCAL_PARTS) else 1
@@ -171,72 +163,52 @@ def extract_emails_from_text(text: str) -> list[str]:
     return sorted(clean, key=priority)
 
 
-async def google_search_for_website(vendor_name: str, address: str) -> str | None:
-    """
-    Google search: '"Vendor Name" "City" contact email site'
-    Extract the first non-Yelp, non-social result URL as their website.
-    """
-    city = address.split(",")[-2].strip() if "," in address else ""
-    query = f'"{vendor_name}" {city} official website'
-    url = f"https://www.google.com/search?q={quote_plus(query)}&num=5"
-
-    skip_domains = {"yelp.com", "facebook.com", "instagram.com", "twitter.com",
-                    "doordash.com", "grubhub.com", "ubereats.com", "tripadvisor.com",
-                    "yellowpages.com", "bbb.org", "google.com"}
-
-    try:
-        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
-            resp = await client.get(url, headers=HEADERS)
-            if resp.status_code != 200:
-                return None
-
-            text = resp.text
-
-            # Extract URLs from Google result links
-            # Google wraps results in /url?q=... redirects
-            raw_links = re.findall(r'/url\?q=(https?://[^&"]+)', text)
-            for link in raw_links:
-                link = unquote(link)
-                domain = urlparse(link).netloc.replace("www.", "")
-                if not any(skip in domain for skip in skip_domains):
-                    # Looks like a real business website
-                    return link.split("?")[0].rstrip("/")
-    except Exception:
-        pass
-    return None
-
-
 async def google_search_for_email(vendor_name: str, address: str) -> str | None:
-    """
-    Google search: '"Vendor Name" "City" email contact
-    Look for email patterns directly in the search result snippets.
-    """
     city = address.split(",")[-2].strip() if "," in address else ""
     query = f'"{vendor_name}" {city} email contact'
     url = f"https://www.google.com/search?q={quote_plus(query)}&num=5"
-
     try:
         async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
             resp = await client.get(url, headers=HEADERS)
             if resp.status_code != 200:
                 return None
-
             emails = extract_emails_from_text(resp.text)
-            # Filter out Google's own emails and generic ones
             filtered = [e for e in emails if "google" not in e and "example" not in e]
             return filtered[0] if filtered else None
     except Exception:
         return None
 
 
+async def google_search_for_website(vendor_name: str, address: str) -> str | None:
+    city = address.split(",")[-2].strip() if "," in address else ""
+    query = f'"{vendor_name}" {city} official website'
+    url = f"https://www.google.com/search?q={quote_plus(query)}&num=5"
+    skip_domains = {
+        "yelp.com", "facebook.com", "instagram.com", "twitter.com",
+        "doordash.com", "grubhub.com", "ubereats.com", "tripadvisor.com",
+        "yellowpages.com", "bbb.org", "google.com",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+            resp = await client.get(url, headers=HEADERS)
+            if resp.status_code != 200:
+                return None
+            raw_links = re.findall(r'/url\?q=(https?://[^&"]+)', resp.text)
+            for link in raw_links:
+                link = unquote(link)
+                domain = urlparse(link).netloc.replace("www.", "")
+                if not any(skip in domain for skip in skip_domains):
+                    return link.split("?")[0].rstrip("/")
+    except Exception:
+        pass
+    return None
+
+
 async def scrape_email_from_website(website_url: str) -> str | None:
-    """Visit a business website and scrape for contact emails."""
     if not website_url:
         return None
-
     base = website_url.rstrip("/")
     pages_to_check = [base, f"{base}/contact", f"{base}/contact-us", f"{base}/about"]
-
     async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
         for page_url in pages_to_check:
             try:
@@ -250,25 +222,14 @@ async def scrape_email_from_website(website_url: str) -> str | None:
     return None
 
 
-async def find_vendor_email(vendor_name: str, address: str) -> tuple[str | None, str | None]:
-    """
-    Multi-strategy email finder. Returns (email, website).
-
-    Strategy:
-    1. Google search result snippets for email directly
-    2. Google search for their website, then scrape it
-    """
-    # Strategy 1: Look for email directly in Google search snippets
+async def find_vendor_email(vendor_name: str, address: str) -> tuple:
     email = await google_search_for_email(vendor_name, address)
     if email:
         return email, None
-
-    # Strategy 2: Find their website via Google, then scrape it
     website = await google_search_for_website(vendor_name, address)
     if website:
         email = await scrape_email_from_website(website)
         return email, website
-
     return None, None
 
 
@@ -291,9 +252,6 @@ async def webhook(
 # ── vendor search endpoint ────────────────────────────────────────────────────
 @app.post("/search-vendors")
 async def search_vendors(payload: dict):
-    """
-    Search Yelp, enrich with emails via Google search, rank with Bayesian algorithm.
-    """
     category = payload.get("category", "caterers")
     location = payload.get("location", "Los Angeles, CA")
     budget = payload.get("budget")
@@ -304,17 +262,11 @@ async def search_vendors(payload: dict):
 
     search_term = f"{keywords} {category}".strip()
 
-    # Step 1: Yelp search
     async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.get(
             "https://api.yelp.com/v3/businesses/search",
             headers={"Authorization": f"Bearer {YELP_API_KEY}"},
-            params={
-                "term": search_term,
-                "location": location,
-                "limit": 20,
-                "sort_by": "rating",
-            },
+            params={"term": search_term, "location": location, "limit": 20, "sort_by": "rating"},
         )
 
     if response.status_code != 200:
@@ -323,7 +275,6 @@ async def search_vendors(payload: dict):
     businesses = response.json().get("businesses", [])
     filtered = [b for b in businesses if b.get("rating", 0) >= min_rating]
 
-    # Step 2: Shape data
     vendors = []
     for b in filtered:
         vendors.append({
@@ -342,7 +293,6 @@ async def search_vendors(payload: dict):
             "website": None,
         })
 
-    # Step 3: Find emails via Google search (top 10 only for speed)
     if scrape_emails and vendors:
         import asyncio
 
@@ -361,10 +311,8 @@ async def search_vendors(payload: dict):
         enriched = await asyncio.gather(*[enrich_vendor(v) for v in top])
         vendors = list(enriched) + rest
 
-    # Step 4: Bayesian ranking
     vendors = rank_vendors(vendors, {"keywords": keywords})
 
-    # Step 5: Claude AI reasons for top 5
     if vendors:
         try:
             summary_prompt = f"""I'm looking for {category} for an event with {guest_count} guests, budget under ${budget}.
@@ -377,7 +325,6 @@ Here are the top vendors: {json.dumps([{
 For each vendor write a 1-sentence reason why they're a good fit for this event.
 Respond ONLY with a JSON array: [{{"id": "...", "reason": "..."}}]
 No markdown, no explanation."""
-
             claude_response = anthropic_client.messages.create(
                 model="claude-opus-4-5",
                 max_tokens=500,
@@ -394,14 +341,57 @@ No markdown, no explanation."""
         "vendors": vendors,
         "total": len(vendors),
         "emails_found": sum(1 for v in vendors if v.get("email")),
-        "query": {
-            "category": category,
-            "location": location,
-            "budget": budget,
-            "guest_count": guest_count,
-            "min_rating": min_rating,
-        }
+        "query": {"category": category, "location": location, "budget": budget, "guest_count": guest_count, "min_rating": min_rating}
     }
+
+
+# ── debug email endpoint ──────────────────────────────────────────────────────
+@app.post("/debug-email")
+async def debug_email(payload: dict):
+    """Debug endpoint — tests email finding for a single vendor and shows raw results."""
+    name = payload.get("name", "Rutt's Catering")
+    address = payload.get("address", "Los Angeles, CA")
+    city = address.split(",")[-2].strip() if "," in address else ""
+
+    results = {}
+
+    # Test 1: Google email search
+    query1 = f'"{name}" {city} email contact'
+    url1 = f"https://www.google.com/search?q={quote_plus(query1)}&num=5"
+    results["query_1"] = query1
+
+    async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+        try:
+            resp = await client.get(url1, headers=HEADERS)
+            results["email_search_status"] = resp.status_code
+            results["email_search_html_length"] = len(resp.text)
+            emails = extract_emails_from_text(resp.text)
+            results["emails_in_snippets"] = emails[:10]
+            results["google_html_preview"] = resp.text[:800]
+        except Exception as e:
+            results["email_search_error"] = str(e)
+
+    # Test 2: Google website search
+    query2 = f'"{name}" {city} official website'
+    url2 = f"https://www.google.com/search?q={quote_plus(query2)}&num=5"
+    results["query_2"] = query2
+
+    async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+        try:
+            resp2 = await client.get(url2, headers=HEADERS)
+            results["website_search_status"] = resp2.status_code
+            raw_links = re.findall(r'/url\?q=(https?://[^&"]+)', resp2.text)
+            results["raw_links_found"] = [unquote(l) for l in raw_links[:5]]
+            results["website_html_preview"] = resp2.text[:800]
+        except Exception as e:
+            results["website_search_error"] = str(e)
+
+    # Run the full pipeline
+    email, website = await find_vendor_email(name, address)
+    results["final_email"] = email
+    results["final_website"] = website
+
+    return results
 
 
 # ── admin endpoints ───────────────────────────────────────────────────────────
@@ -427,8 +417,8 @@ async def get_conversation(phone_number: str):
 async def introduce_two_people(payload: dict):
     phone_a = f"whatsapp:{payload['phone_a']}"
     phone_b = f"whatsapp:{payload['phone_b']}"
-    msg_to_a = (f"Hey! I've been thinking about you and I have someone you should meet. {payload['name_b']} — {payload['reason']}. Tip: {payload['icebreaker']} 🎯")
-    msg_to_b = (f"Hey! I want to introduce you to someone. {payload['name_a']} — {payload['reason']}. Tip: {payload['icebreaker']} 🎯")
+    msg_to_a = f"Hey! I've been thinking about you and I have someone you should meet. {payload['name_b']} — {payload['reason']}. Tip: {payload['icebreaker']} 🎯"
+    msg_to_b = f"Hey! I want to introduce you to someone. {payload['name_a']} — {payload['reason']}. Tip: {payload['icebreaker']} 🎯"
     send_whatsapp_message(phone_a, msg_to_a)
     send_whatsapp_message(phone_b, msg_to_b)
     return {"status": "sent", "to": [phone_a, phone_b]}
@@ -439,7 +429,7 @@ async def send_event_reminder(payload: dict):
     phones = payload.get("phones")
     if not phones:
         phones = [p.replace("whatsapp:", "") for p in conversations.keys()]
-    msg = (f"🗓 Reminder: {payload['event_name']} is happening {payload['date']} at {payload['time']}! Come to {payload['location']}. I'll send you a heads-up on who to look out for before the night. See you there!")
+    msg = f"🗓 Reminder: {payload['event_name']} is happening {payload['date']} at {payload['time']}! Come to {payload['location']}. I'll send you a heads-up on who to look out for before the night. See you there!"
     for phone in phones:
         send_whatsapp_message(f"whatsapp:{phone}", msg)
     return {"status": "sent", "count": len(phones)}

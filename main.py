@@ -35,6 +35,7 @@ anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 TWILIO_WHATSAPP_NUMBER = os.environ.get("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
 YELP_API_KEY = os.environ.get("YELP_API_KEY", "")
 SERP_API_KEY = os.environ.get("SERP_API_KEY", "")
+HUNTER_API_KEY = os.environ.get("HUNTER_API_KEY", "")
 GMAIL_CLIENT_ID = os.environ.get("GMAIL_CLIENT_ID", "")
 GMAIL_CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET", "")
 GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN", "")
@@ -109,7 +110,6 @@ def send_whatsapp_message(to: str, body: str):
 
 # ── Gmail sending ─────────────────────────────────────────────────────────────
 async def get_gmail_access_token() -> str:
-    """Exchange refresh token for a fresh access token."""
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             "https://oauth2.googleapis.com/token",
@@ -127,27 +127,18 @@ async def get_gmail_access_token() -> str:
 
 
 async def send_gmail(to: str, subject: str, body: str) -> dict:
-    """Send an email via Gmail API."""
     access_token = await get_gmail_access_token()
-
-    # Build the email
     msg = MIMEText(body, "plain")
     msg["To"] = to
     msg["From"] = GMAIL_SENDER
     msg["Subject"] = subject
-
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
-
     async with httpx.AsyncClient() as client:
         resp = await client.post(
-            f"https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json",
-            },
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
             json={"raw": raw},
         )
-
     if resp.status_code == 200:
         return {"status": "sent", "message_id": resp.json().get("id")}
     else:
@@ -177,7 +168,7 @@ def rank_vendors(vendors: list, search_params: dict) -> list:
     return sorted(vendors, key=lambda v: v["score"], reverse=True)
 
 
-# ── email finding via SerpAPI ─────────────────────────────────────────────────
+# ── email finding ─────────────────────────────────────────────────────────────
 EMAIL_PATTERN = re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b')
 
 IGNORE_DOMAINS = {
@@ -228,44 +219,59 @@ async def serp_search(query: str) -> dict:
     return {}
 
 
-async def find_vendor_email(vendor_name: str, address: str) -> tuple:
-    city = address.split(",")[-2].strip() if "," in address else ""
+async def hunter_find_email(domain: str) -> str | None:
+    """
+    Use Hunter.io domain search to find the best contact email for a domain.
+    Returns the highest confidence email found, or None.
+    """
+    if not HUNTER_API_KEY or not domain:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(
+                "https://api.hunter.io/v2/domain-search",
+                params={
+                    "domain": domain,
+                    "api_key": HUNTER_API_KEY,
+                    "limit": 5,
+                    "type": "generic",  # prefer generic contact emails over personal
+                },
+            )
+            if resp.status_code != 200:
+                return None
 
-    data = await serp_search(f'"{vendor_name}" {city} email contact')
-    organic = data.get("organic_results", [])
-    for result in organic:
-        snippet = result.get("snippet", "")
-        emails = extract_emails_from_text(snippet)
-        if emails:
-            return emails[0], result.get("link")
-        link = result.get("link", "")
-        emails = extract_emails_from_text(link)
-        if emails:
-            return emails[0], link
+            data = resp.json()
+            emails = data.get("data", {}).get("emails", [])
 
-    skip_domains = {
-        "yelp.com", "facebook.com", "instagram.com", "twitter.com",
-        "doordash.com", "grubhub.com", "ubereats.com", "tripadvisor.com",
-        "yellowpages.com", "bbb.org", "google.com", "yelp.to",
-    }
+            if not emails:
+                # Fall back to pattern-based guess from Hunter
+                pattern = data.get("data", {}).get("pattern")
+                org = data.get("data", {}).get("organization", "")
+                if pattern and org:
+                    # Hunter found a pattern but no emails — try common prefixes
+                    for prefix in ["info", "contact", "hello", "events"]:
+                        guessed = f"{prefix}@{domain}"
+                        print(f"[hunter] Pattern found, guessing: {guessed}")
+                        return guessed
+                return None
 
-    data2 = await serp_search(f'"{vendor_name}" {city} official website catering')
-    organic2 = data2.get("organic_results", [])
-    website = None
-    for result in organic2:
-        link = result.get("link", "")
-        domain = urlparse(link).netloc.replace("www.", "")
-        if link and not any(skip in domain for skip in skip_domains):
-            website = link.split("?")[0].rstrip("/")
-            break
+            # Sort by confidence, prefer generic/role emails
+            def email_priority(e):
+                local = e.get("value", "").split("@")[0]
+                score = e.get("confidence", 0)
+                if any(kw in local for kw in PRIORITY_LOCAL_PARTS):
+                    score += 50  # boost contact-type emails
+                return score
 
-    if website:
-        email = await scrape_email_from_website(website)
-        if email:
-            return email, website
-        return None, website
+            emails_sorted = sorted(emails, key=email_priority, reverse=True)
+            best = emails_sorted[0].get("value")
+            confidence = emails_sorted[0].get("confidence", 0)
+            print(f"[hunter] Found {best} (confidence: {confidence}) for {domain}")
+            return best
 
-    return None, None
+    except Exception as e:
+        print(f"[hunter error] {domain}: {e}")
+        return None
 
 
 async def scrape_email_from_website(website_url: str) -> str | None:
@@ -284,6 +290,81 @@ async def scrape_email_from_website(website_url: str) -> str | None:
             except Exception:
                 continue
     return None
+
+
+async def find_vendor_email(vendor_name: str, address: str) -> tuple:
+    """
+    Multi-strategy email finder:
+    1. SerpAPI — look for email directly in search snippets
+    2. SerpAPI — find their website, then scrape it
+    3. Hunter.io — domain search on their website
+    4. Hunter.io — domain search on guessed domain from vendor name
+    """
+    city = address.split(",")[-2].strip() if "," in address else ""
+
+    # Strategy 1: Email directly in SerpAPI snippets
+    data = await serp_search(f'"{vendor_name}" {city} email contact')
+    organic = data.get("organic_results", [])
+    website = None
+
+    for result in organic:
+        snippet = result.get("snippet", "")
+        emails = extract_emails_from_text(snippet)
+        if emails:
+            print(f"[serp] Found email in snippet for {vendor_name}: {emails[0]}")
+            return emails[0], result.get("link")
+        link = result.get("link", "")
+        emails = extract_emails_from_text(link)
+        if emails:
+            print(f"[serp] Found email in link for {vendor_name}: {emails[0]}")
+            return emails[0], link
+
+    # Strategy 2: Find website via SerpAPI
+    skip_domains = {
+        "yelp.com", "facebook.com", "instagram.com", "twitter.com",
+        "doordash.com", "grubhub.com", "ubereats.com", "tripadvisor.com",
+        "yellowpages.com", "bbb.org", "google.com", "yelp.to",
+    }
+
+    data2 = await serp_search(f'"{vendor_name}" {city} official website catering')
+    for result in data2.get("organic_results", []):
+        link = result.get("link", "")
+        domain = urlparse(link).netloc.replace("www.", "")
+        if link and not any(skip in domain for skip in skip_domains):
+            website = link.split("?")[0].rstrip("/")
+            break
+
+    # Strategy 3: Scrape the website directly
+    if website:
+        email = await scrape_email_from_website(website)
+        if email:
+            print(f"[scrape] Found email on website for {vendor_name}: {email}")
+            return email, website
+
+        # Strategy 4: Hunter.io on the website domain
+        domain = urlparse(website).netloc.replace("www.", "")
+        if domain:
+            email = await hunter_find_email(domain)
+            if email:
+                return email, website
+
+    # Strategy 5: Hunter.io on a guessed domain
+    # Try common patterns: vendorname.com, vendornamela.com etc
+    if HUNTER_API_KEY:
+        clean_name = re.sub(r'[^a-z0-9]', '', vendor_name.lower())
+        guessed_domains = [
+            f"{clean_name}.com",
+            f"{clean_name}catering.com",
+            f"{clean_name}la.com",
+        ]
+        for guessed_domain in guessed_domains:
+            email = await hunter_find_email(guessed_domain)
+            if email:
+                print(f"[hunter-guess] Found email for {vendor_name} via {guessed_domain}: {email}")
+                return email, f"https://{guessed_domain}"
+
+    print(f"[email] Nothing found for {vendor_name}")
+    return None, website
 
 
 # ── webhook endpoint ──────────────────────────────────────────────────────────
@@ -346,7 +427,7 @@ async def search_vendors(payload: dict):
             "website": None,
         })
 
-    if scrape_emails and vendors and SERP_API_KEY:
+    if scrape_emails and vendors:
         import asyncio
 
         async def enrich_vendor(vendor):
@@ -354,7 +435,6 @@ async def search_vendors(payload: dict):
                 email, website = await find_vendor_email(vendor["name"], vendor["address"])
                 vendor["email"] = email
                 vendor["website"] = website
-                print(f"[email] {vendor['name']} → {email or 'not found'}")
             except Exception as e:
                 print(f"[email error] {vendor['name']}: {e}")
             return vendor
@@ -401,15 +481,6 @@ No markdown, no explanation."""
 # ── send vendor email endpoint ────────────────────────────────────────────────
 @app.post("/send-vendor-email")
 async def send_vendor_email(payload: dict):
-    """
-    Send an email to a vendor via Gmail.
-    POST body: {
-        "to": "vendor@example.com",
-        "subject": "Catering inquiry for our event",
-        "body": "Hi, I'm reaching out about...",
-        "vendor_name": "Rutt's Catering"  // for logging
-    }
-    """
     to = payload.get("to")
     subject = payload.get("subject")
     body = payload.get("body")
@@ -424,13 +495,7 @@ async def send_vendor_email(payload: dict):
     try:
         result = await send_gmail(to, subject, body)
         print(f"[gmail] Sent to {vendor_name} <{to}>: {subject}")
-        return {
-            "status": "sent",
-            "to": to,
-            "vendor_name": vendor_name,
-            "subject": subject,
-            "message_id": result.get("message_id"),
-        }
+        return {"status": "sent", "to": to, "vendor_name": vendor_name, "subject": subject, "message_id": result.get("message_id")}
     except Exception as e:
         print(f"[gmail error] {e}")
         return {"error": str(e)}
@@ -445,6 +510,7 @@ async def debug_email(payload: dict):
 
     results = {}
     results["serp_api_key_set"] = bool(SERP_API_KEY)
+    results["hunter_api_key_set"] = bool(HUNTER_API_KEY)
 
     query1 = f'"{name}" {city} email contact'
     results["query_1"] = query1

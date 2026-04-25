@@ -32,6 +32,7 @@ anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 TWILIO_WHATSAPP_NUMBER = os.environ.get("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
 YELP_API_KEY = os.environ.get("YELP_API_KEY", "")
+SERP_API_KEY = os.environ.get("SERP_API_KEY", "")
 
 # ── in-memory store ───────────────────────────────────────────────────────────
 conversations: dict = {}
@@ -123,7 +124,7 @@ def rank_vendors(vendors: list, search_params: dict) -> list:
     return sorted(vendors, key=lambda v: v["score"], reverse=True)
 
 
-# ── email finding ─────────────────────────────────────────────────────────────
+# ── email finding via SerpAPI ─────────────────────────────────────────────────
 EMAIL_PATTERN = re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b')
 
 IGNORE_DOMAINS = {
@@ -144,6 +145,7 @@ HEADERS = {
 
 
 def extract_emails_from_text(text: str) -> list:
+    """Extract and prioritize contact emails from any text."""
     mailto = re.findall(r'mailto:([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})', text)
     plain = EMAIL_PATTERN.findall(text)
     all_emails = mailto + plain
@@ -163,48 +165,86 @@ def extract_emails_from_text(text: str) -> list:
     return sorted(clean, key=priority)
 
 
-async def google_search_for_email(vendor_name: str, address: str) -> str | None:
-    city = address.split(",")[-2].strip() if "," in address else ""
-    query = f'"{vendor_name}" {city} email contact'
-    url = f"https://www.google.com/search?q={quote_plus(query)}&num=5"
-    try:
-        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
-            resp = await client.get(url, headers=HEADERS)
-            if resp.status_code != 200:
-                return None
-            emails = extract_emails_from_text(resp.text)
-            filtered = [e for e in emails if "google" not in e and "example" not in e]
-            return filtered[0] if filtered else None
-    except Exception:
-        return None
+async def serp_search(query: str) -> dict:
+    """
+    Call SerpAPI to get clean Google search results as JSON.
+    Returns the full SerpAPI response dict.
+    """
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(
+            "https://serpapi.com/search",
+            params={
+                "q": query,
+                "api_key": SERP_API_KEY,
+                "engine": "google",
+                "num": 5,
+            },
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    return {}
 
 
-async def google_search_for_website(vendor_name: str, address: str) -> str | None:
+async def find_vendor_email(vendor_name: str, address: str) -> tuple:
+    """
+    Multi-strategy email finder using SerpAPI.
+
+    Strategy 1: Search for email directly in Google result snippets
+    Strategy 2: Find their website from search results, then scrape it
+    """
     city = address.split(",")[-2].strip() if "," in address else ""
-    query = f'"{vendor_name}" {city} official website'
-    url = f"https://www.google.com/search?q={quote_plus(query)}&num=5"
+
+    # Strategy 1: Look for email in search snippets directly
+    data = await serp_search(f'"{vendor_name}" {city} email contact')
+
+    organic = data.get("organic_results", [])
+    for result in organic:
+        # Check snippet for emails
+        snippet = result.get("snippet", "")
+        emails = extract_emails_from_text(snippet)
+        if emails:
+            print(f"[email] Found in snippet for {vendor_name}: {emails[0]}")
+            return emails[0], result.get("link")
+
+        # Check the displayed link
+        link = result.get("link", "")
+        emails = extract_emails_from_text(link)
+        if emails:
+            print(f"[email] Found in link for {vendor_name}: {emails[0]}")
+            return emails[0], link
+
+    # Strategy 2: Find their website, then scrape it
     skip_domains = {
         "yelp.com", "facebook.com", "instagram.com", "twitter.com",
         "doordash.com", "grubhub.com", "ubereats.com", "tripadvisor.com",
-        "yellowpages.com", "bbb.org", "google.com",
+        "yellowpages.com", "bbb.org", "google.com", "yelp.to",
     }
-    try:
-        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
-            resp = await client.get(url, headers=HEADERS)
-            if resp.status_code != 200:
-                return None
-            raw_links = re.findall(r'/url\?q=(https?://[^&"]+)', resp.text)
-            for link in raw_links:
-                link = unquote(link)
-                domain = urlparse(link).netloc.replace("www.", "")
-                if not any(skip in domain for skip in skip_domains):
-                    return link.split("?")[0].rstrip("/")
-    except Exception:
-        pass
-    return None
+
+    data2 = await serp_search(f'"{vendor_name}" {city} official website catering')
+    organic2 = data2.get("organic_results", [])
+
+    website = None
+    for result in organic2:
+        link = result.get("link", "")
+        domain = urlparse(link).netloc.replace("www.", "")
+        if link and not any(skip in domain for skip in skip_domains):
+            website = link.split("?")[0].rstrip("/")
+            break
+
+    if website:
+        email = await scrape_email_from_website(website)
+        if email:
+            print(f"[email] Found on website {website} for {vendor_name}: {email}")
+            return email, website
+        print(f"[email] Website found but no email for {vendor_name}: {website}")
+        return None, website
+
+    print(f"[email] Nothing found for {vendor_name}")
+    return None, None
 
 
 async def scrape_email_from_website(website_url: str) -> str | None:
+    """Visit a business website and scrape for contact emails."""
     if not website_url:
         return None
     base = website_url.rstrip("/")
@@ -220,17 +260,6 @@ async def scrape_email_from_website(website_url: str) -> str | None:
             except Exception:
                 continue
     return None
-
-
-async def find_vendor_email(vendor_name: str, address: str) -> tuple:
-    email = await google_search_for_email(vendor_name, address)
-    if email:
-        return email, None
-    website = await google_search_for_website(vendor_name, address)
-    if website:
-        email = await scrape_email_from_website(website)
-        return email, website
-    return None, None
 
 
 # ── webhook endpoint ──────────────────────────────────────────────────────────
@@ -293,7 +322,7 @@ async def search_vendors(payload: dict):
             "website": None,
         })
 
-    if scrape_emails and vendors:
+    if scrape_emails and vendors and SERP_API_KEY:
         import asyncio
 
         async def enrich_vendor(vendor):
@@ -301,7 +330,6 @@ async def search_vendors(payload: dict):
                 email, website = await find_vendor_email(vendor["name"], vendor["address"])
                 vendor["email"] = email
                 vendor["website"] = website
-                print(f"[email] {vendor['name']} → {email or 'not found'} | site: {website or 'not found'}")
             except Exception as e:
                 print(f"[email error] {vendor['name']}: {e}")
             return vendor
@@ -348,45 +376,35 @@ No markdown, no explanation."""
 # ── debug email endpoint ──────────────────────────────────────────────────────
 @app.post("/debug-email")
 async def debug_email(payload: dict):
-    """Debug endpoint — tests email finding for a single vendor and shows raw results."""
+    """Debug endpoint — tests SerpAPI email finding for a single vendor."""
     name = payload.get("name", "Rutt's Catering")
     address = payload.get("address", "Los Angeles, CA")
     city = address.split(",")[-2].strip() if "," in address else ""
 
     results = {}
+    results["serp_api_key_set"] = bool(SERP_API_KEY)
 
-    # Test 1: Google email search
+    # Test 1: email search via SerpAPI
     query1 = f'"{name}" {city} email contact'
-    url1 = f"https://www.google.com/search?q={quote_plus(query1)}&num=5"
     results["query_1"] = query1
+    data1 = await serp_search(query1)
+    results["serp_status"] = "ok" if data1 else "failed"
+    results["organic_results_count"] = len(data1.get("organic_results", []))
+    results["snippets"] = [
+        {"title": r.get("title"), "snippet": r.get("snippet"), "link": r.get("link")}
+        for r in data1.get("organic_results", [])[:3]
+    ]
 
-    async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
-        try:
-            resp = await client.get(url1, headers=HEADERS)
-            results["email_search_status"] = resp.status_code
-            results["email_search_html_length"] = len(resp.text)
-            emails = extract_emails_from_text(resp.text)
-            results["emails_in_snippets"] = emails[:10]
-            results["google_html_preview"] = resp.text[:800]
-        except Exception as e:
-            results["email_search_error"] = str(e)
-
-    # Test 2: Google website search
-    query2 = f'"{name}" {city} official website'
-    url2 = f"https://www.google.com/search?q={quote_plus(query2)}&num=5"
+    # Test 2: website search
+    query2 = f'"{name}" {city} official website catering'
     results["query_2"] = query2
+    data2 = await serp_search(query2)
+    results["website_results"] = [
+        {"title": r.get("title"), "link": r.get("link")}
+        for r in data2.get("organic_results", [])[:3]
+    ]
 
-    async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
-        try:
-            resp2 = await client.get(url2, headers=HEADERS)
-            results["website_search_status"] = resp2.status_code
-            raw_links = re.findall(r'/url\?q=(https?://[^&"]+)', resp2.text)
-            results["raw_links_found"] = [unquote(l) for l in raw_links[:5]]
-            results["website_html_preview"] = resp2.text[:800]
-        except Exception as e:
-            results["website_search_error"] = str(e)
-
-    # Run the full pipeline
+    # Full pipeline
     email, website = await find_vendor_email(name, address)
     results["final_email"] = email
     results["final_website"] = website

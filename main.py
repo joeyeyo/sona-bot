@@ -172,11 +172,27 @@ def rank_vendors(vendors: list, search_params: dict) -> list:
 EMAIL_PATTERN = re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b')
 
 IGNORE_DOMAINS = {
-    "sentry.io", "wixpress.com", "squarespace.com", "wordpress.com",
-    "shopify.com", "example.com", "yourdomain.com", "email.com",
+    # Analytics & tracking
+    "sentry.io", "mapquest.com", "doubleclick.net", "googletagmanager.com",
+    "googleapis.com", "gstatic.com", "cloudflare.com", "akamai.com",
+    "newrelic.com", "segment.com", "mixpanel.com", "amplitude.com",
+    "intercom.io", "zendesk.com", "hubspot.com", "mailchimp.com",
+    # Website builders
+    "wixpress.com", "squarespace.com", "wordpress.com", "shopify.com",
+    "weebly.com", "webflow.io", "godaddy.com",
+    # Generic/placeholder
+    "example.com", "yourdomain.com", "email.com", "domain.com",
+    "yoursite.com", "company.com",
+    # Big providers
     "google.com", "gmail.com", "yahoo.com", "hotmail.com", "outlook.com",
+    "icloud.com", "me.com", "mac.com", "live.com",
+    # Social/aggregators
     "yelp.com", "facebook.com", "instagram.com", "twitter.com",
-    "png", "jpg", "jpeg", "gif", "webp", "svg",
+    "tiktok.com", "linkedin.com", "pinterest.com",
+    "doordash.com", "grubhub.com", "ubereats.com", "tripadvisor.com",
+    "opentable.com", "resy.com", "thumbtack.com",
+    # File extensions accidentally matched
+    "png", "jpg", "jpeg", "gif", "webp", "svg", "pdf", "css", "js",
 }
 
 PRIORITY_LOCAL_PARTS = ["contact", "info", "hello", "events", "booking", "catering", "hire", "enquir", "inquir"]
@@ -189,17 +205,31 @@ HEADERS = {
 
 
 def extract_emails_from_text(text: str) -> list:
+    """Extract contact emails from text, stripping scripts and styles first."""
+    # Strip script and style tags to avoid false positives from analytics/tracking code
+    text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
+
+    # Prioritize mailto: links as they are most reliable
     mailto = re.findall(r'mailto:([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})', text)
     plain = EMAIL_PATTERN.findall(text)
     all_emails = mailto + plain
+
     clean = []
     seen = set()
     for email in all_emails:
         email = email.lower().strip().rstrip(".,;")
         domain = email.split("@")[-1]
-        if domain not in IGNORE_DOMAINS and email not in seen and len(email) < 80:
-            seen.add(email)
-            clean.append(email)
+        # Skip ignored domains
+        if domain in IGNORE_DOMAINS:
+            continue
+        # Skip if any ignored domain is a substring (catches subdomains)
+        if any(ignored in domain for ignored in IGNORE_DOMAINS if "." in ignored):
+            continue
+        if email in seen or len(email) > 80:
+            continue
+        seen.add(email)
+        clean.append(email)
 
     def priority(e):
         local = e.split("@")[0]
@@ -220,22 +250,14 @@ async def serp_search(query: str) -> dict:
 
 
 async def hunter_find_email(domain: str) -> str | None:
-    """
-    Use Hunter.io domain search to find the best contact email for a domain.
-    Returns the highest confidence email found, or None.
-    """
+    """Use Hunter.io domain search to find the best contact email."""
     if not HUNTER_API_KEY or not domain:
         return None
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:
             resp = await client.get(
                 "https://api.hunter.io/v2/domain-search",
-                params={
-                    "domain": domain,
-                    "api_key": HUNTER_API_KEY,
-                    "limit": 5,
-                    "type": "generic",  # prefer generic contact emails over personal
-                },
+                params={"domain": domain, "api_key": HUNTER_API_KEY, "limit": 5, "type": "generic"},
             )
             if resp.status_code != 200:
                 return None
@@ -244,23 +266,19 @@ async def hunter_find_email(domain: str) -> str | None:
             emails = data.get("data", {}).get("emails", [])
 
             if not emails:
-                # Fall back to pattern-based guess from Hunter
                 pattern = data.get("data", {}).get("pattern")
-                org = data.get("data", {}).get("organization", "")
-                if pattern and org:
-                    # Hunter found a pattern but no emails — try common prefixes
+                if pattern:
                     for prefix in ["info", "contact", "hello", "events"]:
                         guessed = f"{prefix}@{domain}"
                         print(f"[hunter] Pattern found, guessing: {guessed}")
                         return guessed
                 return None
 
-            # Sort by confidence, prefer generic/role emails
             def email_priority(e):
                 local = e.get("value", "").split("@")[0]
                 score = e.get("confidence", 0)
                 if any(kw in local for kw in PRIORITY_LOCAL_PARTS):
-                    score += 50  # boost contact-type emails
+                    score += 50
                 return score
 
             emails_sorted = sorted(emails, key=email_priority, reverse=True)
@@ -275,6 +293,7 @@ async def hunter_find_email(domain: str) -> str | None:
 
 
 async def scrape_email_from_website(website_url: str) -> str | None:
+    """Visit a business website and scrape for contact emails."""
     if not website_url:
         return None
     base = website_url.rstrip("/")
@@ -294,15 +313,16 @@ async def scrape_email_from_website(website_url: str) -> str | None:
 
 async def find_vendor_email(vendor_name: str, address: str) -> tuple:
     """
-    Multi-strategy email finder:
-    1. SerpAPI — look for email directly in search snippets
-    2. SerpAPI — find their website, then scrape it
-    3. Hunter.io — domain search on their website
-    4. Hunter.io — domain search on guessed domain from vendor name
+    5-strategy email finder:
+    1. SerpAPI — email in search snippets
+    2. SerpAPI — email in result links
+    3. Website scraping — visit their site pages
+    4. Hunter.io — domain search on their website
+    5. Hunter.io — guessed domain from vendor name
     """
     city = address.split(",")[-2].strip() if "," in address else ""
 
-    # Strategy 1: Email directly in SerpAPI snippets
+    # Strategy 1 & 2: SerpAPI snippet/link search
     data = await serp_search(f'"{vendor_name}" {city} email contact')
     organic = data.get("organic_results", [])
     website = None
@@ -319,7 +339,7 @@ async def find_vendor_email(vendor_name: str, address: str) -> tuple:
             print(f"[serp] Found email in link for {vendor_name}: {emails[0]}")
             return emails[0], link
 
-    # Strategy 2: Find website via SerpAPI
+    # Strategy 3: Find website and scrape it
     skip_domains = {
         "yelp.com", "facebook.com", "instagram.com", "twitter.com",
         "doordash.com", "grubhub.com", "ubereats.com", "tripadvisor.com",
@@ -334,33 +354,26 @@ async def find_vendor_email(vendor_name: str, address: str) -> tuple:
             website = link.split("?")[0].rstrip("/")
             break
 
-    # Strategy 3: Scrape the website directly
     if website:
         email = await scrape_email_from_website(website)
         if email:
             print(f"[scrape] Found email on website for {vendor_name}: {email}")
             return email, website
 
-        # Strategy 4: Hunter.io on the website domain
+        # Strategy 4: Hunter.io on actual website domain
         domain = urlparse(website).netloc.replace("www.", "")
         if domain:
             email = await hunter_find_email(domain)
             if email:
                 return email, website
 
-    # Strategy 5: Hunter.io on a guessed domain
-    # Try common patterns: vendorname.com, vendornamela.com etc
+    # Strategy 5: Hunter.io on guessed domains
     if HUNTER_API_KEY:
         clean_name = re.sub(r'[^a-z0-9]', '', vendor_name.lower())
-        guessed_domains = [
-            f"{clean_name}.com",
-            f"{clean_name}catering.com",
-            f"{clean_name}la.com",
-        ]
-        for guessed_domain in guessed_domains:
+        for guessed_domain in [f"{clean_name}.com", f"{clean_name}catering.com", f"{clean_name}la.com"]:
             email = await hunter_find_email(guessed_domain)
             if email:
-                print(f"[hunter-guess] Found email for {vendor_name} via {guessed_domain}: {email}")
+                print(f"[hunter-guess] Found for {vendor_name} via {guessed_domain}: {email}")
                 return email, f"https://{guessed_domain}"
 
     print(f"[email] Nothing found for {vendor_name}")

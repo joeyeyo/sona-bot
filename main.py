@@ -8,9 +8,11 @@ import os
 import json
 import httpx
 import re
+import base64
 from datetime import datetime
 from statistics import mean
 from urllib.parse import quote_plus, unquote, urlparse
+from email.mime.text import MIMEText
 
 app = FastAPI()
 
@@ -33,6 +35,10 @@ anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 TWILIO_WHATSAPP_NUMBER = os.environ.get("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
 YELP_API_KEY = os.environ.get("YELP_API_KEY", "")
 SERP_API_KEY = os.environ.get("SERP_API_KEY", "")
+GMAIL_CLIENT_ID = os.environ.get("GMAIL_CLIENT_ID", "")
+GMAIL_CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET", "")
+GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN", "")
+GMAIL_SENDER = os.environ.get("GMAIL_SENDER", "yeh.joseph@gmail.com")
 
 # ── in-memory store ───────────────────────────────────────────────────────────
 conversations: dict = {}
@@ -101,6 +107,53 @@ def send_whatsapp_message(to: str, body: str):
     )
 
 
+# ── Gmail sending ─────────────────────────────────────────────────────────────
+async def get_gmail_access_token() -> str:
+    """Exchange refresh token for a fresh access token."""
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": GMAIL_CLIENT_ID,
+                "client_secret": GMAIL_CLIENT_SECRET,
+                "refresh_token": GMAIL_REFRESH_TOKEN,
+                "grant_type": "refresh_token",
+            },
+        )
+        data = resp.json()
+        if "access_token" not in data:
+            raise Exception(f"Failed to get access token: {data}")
+        return data["access_token"]
+
+
+async def send_gmail(to: str, subject: str, body: str) -> dict:
+    """Send an email via Gmail API."""
+    access_token = await get_gmail_access_token()
+
+    # Build the email
+    msg = MIMEText(body, "plain")
+    msg["To"] = to
+    msg["From"] = GMAIL_SENDER
+    msg["Subject"] = subject
+
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            json={"raw": raw},
+        )
+
+    if resp.status_code == 200:
+        return {"status": "sent", "message_id": resp.json().get("id")}
+    else:
+        raise Exception(f"Gmail send failed: {resp.status_code} {resp.text}")
+
+
 # ── vendor ranking ────────────────────────────────────────────────────────────
 def bayesian_score(rating: float, review_count: int, mean_rating: float, C: int = 50) -> float:
     return (C * mean_rating + rating * review_count) / (C + review_count)
@@ -145,7 +198,6 @@ HEADERS = {
 
 
 def extract_emails_from_text(text: str) -> list:
-    """Extract and prioritize contact emails from any text."""
     mailto = re.findall(r'mailto:([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})', text)
     plain = EMAIL_PATTERN.findall(text)
     all_emails = mailto + plain
@@ -166,19 +218,10 @@ def extract_emails_from_text(text: str) -> list:
 
 
 async def serp_search(query: str) -> dict:
-    """
-    Call SerpAPI to get clean Google search results as JSON.
-    Returns the full SerpAPI response dict.
-    """
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(
             "https://serpapi.com/search",
-            params={
-                "q": query,
-                "api_key": SERP_API_KEY,
-                "engine": "google",
-                "num": 5,
-            },
+            params={"q": query, "api_key": SERP_API_KEY, "engine": "google", "num": 5},
         )
         if resp.status_code == 200:
             return resp.json()
@@ -186,34 +229,20 @@ async def serp_search(query: str) -> dict:
 
 
 async def find_vendor_email(vendor_name: str, address: str) -> tuple:
-    """
-    Multi-strategy email finder using SerpAPI.
-
-    Strategy 1: Search for email directly in Google result snippets
-    Strategy 2: Find their website from search results, then scrape it
-    """
     city = address.split(",")[-2].strip() if "," in address else ""
 
-    # Strategy 1: Look for email in search snippets directly
     data = await serp_search(f'"{vendor_name}" {city} email contact')
-
     organic = data.get("organic_results", [])
     for result in organic:
-        # Check snippet for emails
         snippet = result.get("snippet", "")
         emails = extract_emails_from_text(snippet)
         if emails:
-            print(f"[email] Found in snippet for {vendor_name}: {emails[0]}")
             return emails[0], result.get("link")
-
-        # Check the displayed link
         link = result.get("link", "")
         emails = extract_emails_from_text(link)
         if emails:
-            print(f"[email] Found in link for {vendor_name}: {emails[0]}")
             return emails[0], link
 
-    # Strategy 2: Find their website, then scrape it
     skip_domains = {
         "yelp.com", "facebook.com", "instagram.com", "twitter.com",
         "doordash.com", "grubhub.com", "ubereats.com", "tripadvisor.com",
@@ -222,7 +251,6 @@ async def find_vendor_email(vendor_name: str, address: str) -> tuple:
 
     data2 = await serp_search(f'"{vendor_name}" {city} official website catering')
     organic2 = data2.get("organic_results", [])
-
     website = None
     for result in organic2:
         link = result.get("link", "")
@@ -234,17 +262,13 @@ async def find_vendor_email(vendor_name: str, address: str) -> tuple:
     if website:
         email = await scrape_email_from_website(website)
         if email:
-            print(f"[email] Found on website {website} for {vendor_name}: {email}")
             return email, website
-        print(f"[email] Website found but no email for {vendor_name}: {website}")
         return None, website
 
-    print(f"[email] Nothing found for {vendor_name}")
     return None, None
 
 
 async def scrape_email_from_website(website_url: str) -> str | None:
-    """Visit a business website and scrape for contact emails."""
     if not website_url:
         return None
     base = website_url.rstrip("/")
@@ -330,6 +354,7 @@ async def search_vendors(payload: dict):
                 email, website = await find_vendor_email(vendor["name"], vendor["address"])
                 vendor["email"] = email
                 vendor["website"] = website
+                print(f"[email] {vendor['name']} → {email or 'not found'}")
             except Exception as e:
                 print(f"[email error] {vendor['name']}: {e}")
             return vendor
@@ -373,10 +398,47 @@ No markdown, no explanation."""
     }
 
 
+# ── send vendor email endpoint ────────────────────────────────────────────────
+@app.post("/send-vendor-email")
+async def send_vendor_email(payload: dict):
+    """
+    Send an email to a vendor via Gmail.
+    POST body: {
+        "to": "vendor@example.com",
+        "subject": "Catering inquiry for our event",
+        "body": "Hi, I'm reaching out about...",
+        "vendor_name": "Rutt's Catering"  // for logging
+    }
+    """
+    to = payload.get("to")
+    subject = payload.get("subject")
+    body = payload.get("body")
+    vendor_name = payload.get("vendor_name", "vendor")
+
+    if not all([to, subject, body]):
+        return {"error": "Missing required fields: to, subject, body"}
+
+    if not all([GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN]):
+        return {"error": "Gmail not configured — add GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN to Railway"}
+
+    try:
+        result = await send_gmail(to, subject, body)
+        print(f"[gmail] Sent to {vendor_name} <{to}>: {subject}")
+        return {
+            "status": "sent",
+            "to": to,
+            "vendor_name": vendor_name,
+            "subject": subject,
+            "message_id": result.get("message_id"),
+        }
+    except Exception as e:
+        print(f"[gmail error] {e}")
+        return {"error": str(e)}
+
+
 # ── debug email endpoint ──────────────────────────────────────────────────────
 @app.post("/debug-email")
 async def debug_email(payload: dict):
-    """Debug endpoint — tests SerpAPI email finding for a single vendor."""
     name = payload.get("name", "Rutt's Catering")
     address = payload.get("address", "Los Angeles, CA")
     city = address.split(",")[-2].strip() if "," in address else ""
@@ -384,18 +446,15 @@ async def debug_email(payload: dict):
     results = {}
     results["serp_api_key_set"] = bool(SERP_API_KEY)
 
-    # Test 1: email search via SerpAPI
     query1 = f'"{name}" {city} email contact'
     results["query_1"] = query1
     data1 = await serp_search(query1)
-    results["serp_status"] = "ok" if data1 else "failed"
     results["organic_results_count"] = len(data1.get("organic_results", []))
     results["snippets"] = [
         {"title": r.get("title"), "snippet": r.get("snippet"), "link": r.get("link")}
         for r in data1.get("organic_results", [])[:3]
     ]
 
-    # Test 2: website search
     query2 = f'"{name}" {city} official website catering'
     results["query_2"] = query2
     data2 = await serp_search(query2)
@@ -404,7 +463,6 @@ async def debug_email(payload: dict):
         for r in data2.get("organic_results", [])[:3]
     ]
 
-    # Full pipeline
     email, website = await find_vendor_email(name, address)
     results["final_email"] = email
     results["final_website"] = website

@@ -168,7 +168,7 @@ def rank_vendors(vendors: list, search_params: dict) -> list:
     return sorted(vendors, key=lambda v: v["score"], reverse=True)
 
 
-# ── email finding ─────────────────────────────────────────────────────────────
+# ── email extraction ──────────────────────────────────────────────────────────
 EMAIL_PATTERN = re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b')
 
 IGNORE_DOMAINS = {
@@ -191,6 +191,8 @@ IGNORE_DOMAINS = {
     "tiktok.com", "linkedin.com", "pinterest.com",
     "doordash.com", "grubhub.com", "ubereats.com", "tripadvisor.com",
     "opentable.com", "resy.com", "thumbtack.com",
+    # DuckDuckGo/search engine internals
+    "duckduckgo.com", "bing.com", "yahoo.com",
     # File extensions accidentally matched
     "png", "jpg", "jpeg", "gif", "webp", "svg", "pdf", "css", "js",
 }
@@ -203,14 +205,19 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.5",
 }
 
+SKIP_DOMAINS = {
+    "yelp.com", "facebook.com", "instagram.com", "twitter.com",
+    "doordash.com", "grubhub.com", "ubereats.com", "tripadvisor.com",
+    "yellowpages.com", "bbb.org", "google.com", "yelp.to",
+    "duckduckgo.com", "bing.com",
+}
+
 
 def extract_emails_from_text(text: str) -> list:
     """Extract contact emails from text, stripping scripts and styles first."""
-    # Strip script and style tags to avoid false positives from analytics/tracking code
     text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
 
-    # Prioritize mailto: links as they are most reliable
     mailto = re.findall(r'mailto:([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})', text)
     plain = EMAIL_PATTERN.findall(text)
     all_emails = mailto + plain
@@ -220,10 +227,8 @@ def extract_emails_from_text(text: str) -> list:
     for email in all_emails:
         email = email.lower().strip().rstrip(".,;")
         domain = email.split("@")[-1]
-        # Skip ignored domains
         if domain in IGNORE_DOMAINS:
             continue
-        # Skip if any ignored domain is a substring (catches subdomains)
         if any(ignored in domain for ignored in IGNORE_DOMAINS if "." in ignored):
             continue
         if email in seen or len(email) > 80:
@@ -238,7 +243,23 @@ def extract_emails_from_text(text: str) -> list:
     return sorted(clean, key=priority)
 
 
+def extract_links_from_html(html: str) -> list:
+    """Extract non-skipped URLs from raw HTML."""
+    raw_links = re.findall(r'href=["\']?(https?://[^"\'>\s]+)', html)
+    links = []
+    seen = set()
+    for link in raw_links:
+        link = link.split("?")[0].rstrip("/")
+        domain = urlparse(link).netloc.replace("www.", "")
+        if link not in seen and not any(skip in domain for skip in SKIP_DOMAINS):
+            seen.add(link)
+            links.append(link)
+    return links
+
+
+# ── search backends ───────────────────────────────────────────────────────────
 async def serp_search(query: str) -> dict:
+    """SerpAPI — returns clean Google results as JSON."""
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(
             "https://serpapi.com/search",
@@ -249,6 +270,47 @@ async def serp_search(query: str) -> dict:
     return {}
 
 
+async def ddg_search(query: str) -> list:
+    """
+    DuckDuckGo HTML search — no API key needed, less bot-blocking than Google.
+    Returns list of {title, link, snippet} dicts.
+    """
+    url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+    try:
+        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+            resp = await client.get(url, headers={
+                **HEADERS,
+                "Referer": "https://duckduckgo.com/",
+            })
+            if resp.status_code != 200:
+                return []
+
+            html = resp.text
+            # Extract result blocks
+            results = []
+
+            # DDG HTML result links are in <a class="result__a">
+            titles = re.findall(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', html, re.DOTALL)
+            snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', html, re.DOTALL)
+
+            for i, (link, title) in enumerate(titles[:5]):
+                # DDG wraps URLs in redirects like //duckduckgo.com/l/?uddg=...
+                if "uddg=" in link:
+                    link = unquote(re.search(r'uddg=([^&]+)', link).group(1))
+                snippet = re.sub(r'<[^>]+>', '', snippets[i]) if i < len(snippets) else ""
+                results.append({
+                    "link": link,
+                    "title": re.sub(r'<[^>]+>', '', title).strip(),
+                    "snippet": snippet.strip(),
+                })
+
+            return results
+    except Exception as e:
+        print(f"[ddg error] {e}")
+        return []
+
+
+# ── Hunter.io ─────────────────────────────────────────────────────────────────
 async def hunter_find_email(domain: str) -> str | None:
     """Use Hunter.io domain search to find the best contact email."""
     if not HUNTER_API_KEY or not domain:
@@ -269,9 +331,7 @@ async def hunter_find_email(domain: str) -> str | None:
                 pattern = data.get("data", {}).get("pattern")
                 if pattern:
                     for prefix in ["info", "contact", "hello", "events"]:
-                        guessed = f"{prefix}@{domain}"
-                        print(f"[hunter] Pattern found, guessing: {guessed}")
-                        return guessed
+                        return f"{prefix}@{domain}"
                 return None
 
             def email_priority(e):
@@ -283,8 +343,7 @@ async def hunter_find_email(domain: str) -> str | None:
 
             emails_sorted = sorted(emails, key=email_priority, reverse=True)
             best = emails_sorted[0].get("value")
-            confidence = emails_sorted[0].get("confidence", 0)
-            print(f"[hunter] Found {best} (confidence: {confidence}) for {domain}")
+            print(f"[hunter] {best} for {domain}")
             return best
 
     except Exception as e:
@@ -311,70 +370,87 @@ async def scrape_email_from_website(website_url: str) -> str | None:
     return None
 
 
-async def find_vendor_email(vendor_name: str, address: str) -> tuple:
-    """
-    5-strategy email finder:
-    1. SerpAPI — email in search snippets
-    2. SerpAPI — email in result links
-    3. Website scraping — visit their site pages
-    4. Hunter.io — domain search on their website
-    5. Hunter.io — guessed domain from vendor name
-    """
-    city = address.split(",")[-2].strip() if "," in address else ""
-
-    # Strategy 1 & 2: SerpAPI snippet/link search
-    data = await serp_search(f'"{vendor_name}" {city} email contact')
-    organic = data.get("organic_results", [])
-    website = None
-
-    for result in organic:
-        snippet = result.get("snippet", "")
-        emails = extract_emails_from_text(snippet)
-        if emails:
-            print(f"[serp] Found email in snippet for {vendor_name}: {emails[0]}")
-            return emails[0], result.get("link")
-        link = result.get("link", "")
-        emails = extract_emails_from_text(link)
-        if emails:
-            print(f"[serp] Found email in link for {vendor_name}: {emails[0]}")
-            return emails[0], link
-
-    # Strategy 3: Find website and scrape it
-    skip_domains = {
-        "yelp.com", "facebook.com", "instagram.com", "twitter.com",
-        "doordash.com", "grubhub.com", "ubereats.com", "tripadvisor.com",
-        "yellowpages.com", "bbb.org", "google.com", "yelp.to",
-    }
-
-    data2 = await serp_search(f'"{vendor_name}" {city} official website catering')
-    for result in data2.get("organic_results", []):
+def get_website_from_results(results: list) -> str | None:
+    """Extract first non-skipped website from a list of search results."""
+    for result in results:
         link = result.get("link", "")
         domain = urlparse(link).netloc.replace("www.", "")
-        if link and not any(skip in domain for skip in skip_domains):
-            website = link.split("?")[0].rstrip("/")
-            break
+        if link and not any(skip in domain for skip in SKIP_DOMAINS):
+            return link.split("?")[0].rstrip("/")
+    return None
 
+
+# ── main email finder ─────────────────────────────────────────────────────────
+async def find_vendor_email(vendor_name: str, address: str) -> tuple:
+    """
+    6-strategy email finder pipeline:
+    1. SerpAPI snippets — email in Google result text
+    2. SerpAPI links — email pattern in result URL
+    3. DuckDuckGo — fallback search, email in snippets or links
+    4. Website scraping — visit their site pages
+    5. Hunter.io domain search — on their actual website domain
+    6. Hunter.io guessed domain — from vendor name patterns
+    """
+    city = address.split(",")[-2].strip() if "," in address else ""
+    website = None
+
+    # ── Strategy 1 & 2: SerpAPI ──────────────────────────────────────────────
+    serp_data = await serp_search(f'"{vendor_name}" {city} email contact')
+    serp_organic = serp_data.get("organic_results", [])
+
+    for result in serp_organic:
+        emails = extract_emails_from_text(result.get("snippet", ""))
+        if emails:
+            print(f"[serp-snippet] {vendor_name}: {emails[0]}")
+            return emails[0], result.get("link")
+        emails = extract_emails_from_text(result.get("link", ""))
+        if emails:
+            print(f"[serp-link] {vendor_name}: {emails[0]}")
+            return emails[0], result.get("link")
+
+    # Find website from SerpAPI
+    serp_site_data = await serp_search(f'"{vendor_name}" {city} official website catering')
+    website = get_website_from_results(serp_site_data.get("organic_results", []))
+
+    # ── Strategy 3: DuckDuckGo fallback ──────────────────────────────────────
+    if not website:
+        ddg_results = await ddg_search(f'"{vendor_name}" {city} email contact catering')
+        for result in ddg_results:
+            emails = extract_emails_from_text(result.get("snippet", ""))
+            if emails:
+                print(f"[ddg-snippet] {vendor_name}: {emails[0]}")
+                return emails[0], result.get("link")
+            emails = extract_emails_from_text(result.get("link", ""))
+            if emails:
+                print(f"[ddg-link] {vendor_name}: {emails[0]}")
+                return emails[0], result.get("link")
+
+        # Try DuckDuckGo for website too
+        ddg_site = await ddg_search(f'"{vendor_name}" {city} official site')
+        website = get_website_from_results(ddg_site)
+
+    # ── Strategy 4: Scrape website ────────────────────────────────────────────
     if website:
         email = await scrape_email_from_website(website)
         if email:
-            print(f"[scrape] Found email on website for {vendor_name}: {email}")
+            print(f"[scrape] {vendor_name}: {email}")
             return email, website
 
-        # Strategy 4: Hunter.io on actual website domain
+        # ── Strategy 5: Hunter.io on real domain ──────────────────────────────
         domain = urlparse(website).netloc.replace("www.", "")
         if domain:
             email = await hunter_find_email(domain)
             if email:
                 return email, website
 
-    # Strategy 5: Hunter.io on guessed domains
+    # ── Strategy 6: Hunter.io on guessed domains ──────────────────────────────
     if HUNTER_API_KEY:
-        clean_name = re.sub(r'[^a-z0-9]', '', vendor_name.lower())
-        for guessed_domain in [f"{clean_name}.com", f"{clean_name}catering.com", f"{clean_name}la.com"]:
-            email = await hunter_find_email(guessed_domain)
+        clean = re.sub(r'[^a-z0-9]', '', vendor_name.lower())
+        for guessed in [f"{clean}.com", f"{clean}catering.com", f"{clean}la.com"]:
+            email = await hunter_find_email(guessed)
             if email:
-                print(f"[hunter-guess] Found for {vendor_name} via {guessed_domain}: {email}")
-                return email, f"https://{guessed_domain}"
+                print(f"[hunter-guess] {vendor_name} via {guessed}: {email}")
+                return email, f"https://{guessed}"
 
     print(f"[email] Nothing found for {vendor_name}")
     return None, website
@@ -503,7 +579,7 @@ async def send_vendor_email(payload: dict):
         return {"error": "Missing required fields: to, subject, body"}
 
     if not all([GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN]):
-        return {"error": "Gmail not configured — add GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN to Railway"}
+        return {"error": "Gmail not configured in Railway env vars"}
 
     try:
         result = await send_gmail(to, subject, body)
@@ -521,27 +597,25 @@ async def debug_email(payload: dict):
     address = payload.get("address", "Los Angeles, CA")
     city = address.split(",")[-2].strip() if "," in address else ""
 
-    results = {}
-    results["serp_api_key_set"] = bool(SERP_API_KEY)
-    results["hunter_api_key_set"] = bool(HUNTER_API_KEY)
+    results = {
+        "serp_api_key_set": bool(SERP_API_KEY),
+        "hunter_api_key_set": bool(HUNTER_API_KEY),
+    }
 
+    # SerpAPI
     query1 = f'"{name}" {city} email contact'
-    results["query_1"] = query1
+    results["serp_query"] = query1
     data1 = await serp_search(query1)
-    results["organic_results_count"] = len(data1.get("organic_results", []))
-    results["snippets"] = [
+    results["serp_results"] = [
         {"title": r.get("title"), "snippet": r.get("snippet"), "link": r.get("link")}
         for r in data1.get("organic_results", [])[:3]
     ]
 
-    query2 = f'"{name}" {city} official website catering'
-    results["query_2"] = query2
-    data2 = await serp_search(query2)
-    results["website_results"] = [
-        {"title": r.get("title"), "link": r.get("link")}
-        for r in data2.get("organic_results", [])[:3]
-    ]
+    # DuckDuckGo
+    ddg_results = await ddg_search(f'"{name}" {city} email contact catering')
+    results["ddg_results"] = ddg_results[:3]
 
+    # Full pipeline
     email, website = await find_vendor_email(name, address)
     results["final_email"] = email
     results["final_website"] = website

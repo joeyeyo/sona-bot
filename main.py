@@ -36,6 +36,7 @@ TWILIO_WHATSAPP_NUMBER = os.environ.get("TWILIO_WHATSAPP_NUMBER", "whatsapp:+141
 YELP_API_KEY = os.environ.get("YELP_API_KEY", "")
 SERP_API_KEY = os.environ.get("SERP_API_KEY", "")
 HUNTER_API_KEY = os.environ.get("HUNTER_API_KEY", "")
+GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "")
 GMAIL_CLIENT_ID = os.environ.get("GMAIL_CLIENT_ID", "")
 GMAIL_CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET", "")
 GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN", "")
@@ -172,28 +173,21 @@ def rank_vendors(vendors: list, search_params: dict) -> list:
 EMAIL_PATTERN = re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b')
 
 IGNORE_DOMAINS = {
-    # Analytics & tracking
     "sentry.io", "mapquest.com", "doubleclick.net", "googletagmanager.com",
     "googleapis.com", "gstatic.com", "cloudflare.com", "akamai.com",
     "newrelic.com", "segment.com", "mixpanel.com", "amplitude.com",
     "intercom.io", "zendesk.com", "hubspot.com", "mailchimp.com",
-    # Website builders
     "wixpress.com", "squarespace.com", "wordpress.com", "shopify.com",
     "weebly.com", "webflow.io", "godaddy.com",
-    # Generic/placeholder
     "example.com", "yourdomain.com", "email.com", "domain.com",
     "yoursite.com", "company.com",
-    # Big providers
     "google.com", "gmail.com", "yahoo.com", "hotmail.com", "outlook.com",
     "icloud.com", "me.com", "mac.com", "live.com",
-    # Social/aggregators
     "yelp.com", "facebook.com", "instagram.com", "twitter.com",
     "tiktok.com", "linkedin.com", "pinterest.com",
     "doordash.com", "grubhub.com", "ubereats.com", "tripadvisor.com",
     "opentable.com", "resy.com", "thumbtack.com",
-    # Search engines
     "duckduckgo.com", "bing.com",
-    # File extensions accidentally matched
     "png", "jpg", "jpeg", "gif", "webp", "svg", "pdf", "css", "js",
 }
 
@@ -215,9 +209,11 @@ SKIP_DOMAINS = {
 
 
 def extract_emails_from_text(text: str) -> list:
-    """Extract contact emails from text, stripping scripts and styles first."""
     text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    # Also catch obfuscated emails like info[at]domain.com or info (at) domain.com
+    text = re.sub(r'\[at\]|\(at\)| at ', '@', text, flags=re.IGNORECASE)
+    text = re.sub(r'\[dot\]|\(dot\)| dot ', '.', text, flags=re.IGNORECASE)
 
     mailto = re.findall(r'mailto:([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})', text)
     plain = EMAIL_PATTERN.findall(text)
@@ -245,20 +241,14 @@ def extract_emails_from_text(text: str) -> list:
 
 
 def email_matches_website(email: str, website: str) -> bool:
-    """
-    Sanity check: does the email domain relate to the website domain?
-    Prevents returning emails from unrelated sites.
-    """
     if not email or not website:
         return False
     email_domain = email.split("@")[-1].replace("www.", "")
     site_domain = urlparse(website).netloc.replace("www.", "")
-    # Either the email domain contains the site domain or vice versa
     return email_domain in site_domain or site_domain in email_domain
 
 
 def get_website_from_results(results: list) -> str | None:
-    """Extract first non-skipped website from search results."""
     for result in results:
         link = result.get("link", "")
         domain = urlparse(link).netloc.replace("www.", "")
@@ -267,9 +257,163 @@ def get_website_from_results(results: list) -> str | None:
     return None
 
 
-# ── search backends ───────────────────────────────────────────────────────────
+# ── Google Maps Places API ────────────────────────────────────────────────────
+async def google_maps_find_website(vendor_name: str, address: str) -> str | None:
+    """
+    Use Google Maps Places API to find a business's website.
+    Step 1: Text Search to find the place_id
+    Step 2: Place Details to get website URL
+    """
+    if not GOOGLE_MAPS_API_KEY:
+        return None
+
+    try:
+        query = f"{vendor_name} {address}"
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            # Step 1: Find the place
+            search_resp = await client.get(
+                "https://maps.googleapis.com/maps/api/place/textsearch/json",
+                params={
+                    "query": query,
+                    "key": GOOGLE_MAPS_API_KEY,
+                    "type": "food|restaurant|catering",
+                },
+            )
+            if search_resp.status_code != 200:
+                return None
+
+            results = search_resp.json().get("results", [])
+            if not results:
+                return None
+
+            place_id = results[0].get("place_id")
+            if not place_id:
+                return None
+
+            # Step 2: Get place details including website
+            details_resp = await client.get(
+                "https://maps.googleapis.com/maps/api/place/details/json",
+                params={
+                    "place_id": place_id,
+                    "fields": "website,formatted_phone_number,name",
+                    "key": GOOGLE_MAPS_API_KEY,
+                },
+            )
+            if details_resp.status_code != 200:
+                return None
+
+            result = details_resp.json().get("result", {})
+            website = result.get("website")
+
+            if website:
+                print(f"[gmaps] Found website for {vendor_name}: {website}")
+                return website.rstrip("/")
+
+    except Exception as e:
+        print(f"[gmaps error] {vendor_name}: {e}")
+
+    return None
+
+
+# ── SerpAPI Yelp engine ───────────────────────────────────────────────────────
+async def serp_yelp_find_website(vendor_name: str, city: str) -> str | None:
+    """
+    Use SerpAPI's dedicated Yelp engine to get structured business data
+    including their website URL directly from Yelp's listing.
+    """
+    if not SERP_API_KEY:
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                "https://serpapi.com/search",
+                params={
+                    "engine": "yelp",
+                    "find_desc": vendor_name,
+                    "find_loc": city,
+                    "api_key": SERP_API_KEY,
+                },
+            )
+            if resp.status_code != 200:
+                return None
+
+            data = resp.json()
+
+            # SerpAPI Yelp returns organic_results with business details
+            organic = data.get("organic_results", [])
+            for result in organic:
+                # Check if name roughly matches
+                result_name = result.get("name", "").lower()
+                vendor_lower = vendor_name.lower()
+                # Allow partial match
+                if any(word in result_name for word in vendor_lower.split() if len(word) > 3):
+                    website = result.get("website")
+                    if website:
+                        print(f"[serp-yelp] Found website for {vendor_name}: {website}")
+                        return website.rstrip("/")
+
+                    # Also check if there's a URL in the snippet
+                    snippet = result.get("snippet", "")
+                    emails = extract_emails_from_text(snippet)
+                    if emails:
+                        print(f"[serp-yelp] Found email in snippet for {vendor_name}: {emails[0]}")
+                        return None  # Return None for website but email will be caught upstream
+
+    except Exception as e:
+        print(f"[serp-yelp error] {vendor_name}: {e}")
+
+    return None
+
+
+async def serp_yelp_find_email(vendor_name: str, city: str) -> str | None:
+    """
+    Use SerpAPI Yelp engine specifically to find emails in Yelp listing snippets.
+    """
+    if not SERP_API_KEY:
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                "https://serpapi.com/search",
+                params={
+                    "engine": "yelp",
+                    "find_desc": vendor_name,
+                    "find_loc": city,
+                    "api_key": SERP_API_KEY,
+                },
+            )
+            if resp.status_code != 200:
+                return None
+
+            data = resp.json()
+            organic = data.get("organic_results", [])
+
+            for result in organic:
+                result_name = result.get("name", "").lower()
+                vendor_lower = vendor_name.lower()
+                if any(word in result_name for word in vendor_lower.split() if len(word) > 3):
+                    # Check all text fields for emails
+                    text_to_check = " ".join([
+                        result.get("snippet", ""),
+                        result.get("description", ""),
+                        result.get("website", "") or "",
+                        str(result.get("contact", {})),
+                    ])
+                    emails = extract_emails_from_text(text_to_check)
+                    if emails:
+                        print(f"[serp-yelp-email] Found for {vendor_name}: {emails[0]}")
+                        return emails[0]
+
+    except Exception as e:
+        print(f"[serp-yelp-email error] {vendor_name}: {e}")
+
+    return None
+
+
+# ── SerpAPI Google search ─────────────────────────────────────────────────────
 async def serp_search(query: str) -> dict:
-    """SerpAPI — returns clean Google results as JSON."""
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(
             "https://serpapi.com/search",
@@ -280,40 +424,8 @@ async def serp_search(query: str) -> dict:
     return {}
 
 
-async def ddg_search(query: str) -> list:
-    """DuckDuckGo HTML search — free, no API key, less bot-blocking."""
-    url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
-    try:
-        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
-            resp = await client.get(url, headers={**HEADERS, "Referer": "https://duckduckgo.com/"})
-            if resp.status_code != 200:
-                return []
-
-            html = resp.text
-            results = []
-            titles = re.findall(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', html, re.DOTALL)
-            snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', html, re.DOTALL)
-
-            for i, (link, title) in enumerate(titles[:5]):
-                if "uddg=" in link:
-                    match = re.search(r'uddg=([^&]+)', link)
-                    if match:
-                        link = unquote(match.group(1))
-                snippet = re.sub(r'<[^>]+>', '', snippets[i]) if i < len(snippets) else ""
-                results.append({
-                    "link": link,
-                    "title": re.sub(r'<[^>]+>', '', title).strip(),
-                    "snippet": snippet.strip(),
-                })
-            return results
-    except Exception as e:
-        print(f"[ddg error] {e}")
-        return []
-
-
 # ── Hunter.io ─────────────────────────────────────────────────────────────────
 async def hunter_find_email(domain: str) -> str | None:
-    """Use Hunter.io domain search to find the best contact email."""
     if not HUNTER_API_KEY or not domain:
         return None
     try:
@@ -353,7 +465,6 @@ async def hunter_find_email(domain: str) -> str | None:
 
 
 async def scrape_email_from_website(website_url: str) -> str | None:
-    """Visit a business website and scrape for contact emails."""
     if not website_url:
         return None
     base = website_url.rstrip("/")
@@ -374,22 +485,33 @@ async def scrape_email_from_website(website_url: str) -> str | None:
 # ── main email finder ─────────────────────────────────────────────────────────
 async def find_vendor_email(vendor_name: str, address: str) -> tuple:
     """
-    5-strategy email finder pipeline (guessed domains removed to prevent false positives):
-    1. SerpAPI — email in Google snippets or links
-    2. DuckDuckGo — email in snippets or links (free fallback)
-    3. Website scraping — visit their actual site pages
-    4. Hunter.io — domain search on their real website domain
-    5. Hunter.io — on website found via DuckDuckGo
-    All results pass a domain sanity check before being returned.
+    7-strategy email finder pipeline:
+    1. SerpAPI Yelp engine — email directly from Yelp listing data
+    2. Google Maps Places API — get website URL from structured Maps data
+    3. SerpAPI Yelp engine — get website URL from Yelp listing
+    4. SerpAPI Google — email in search snippets/links
+    5. Website scraping — visit their site pages
+    6. Hunter.io — domain search on real website
+    7. DuckDuckGo — fallback search
     """
     city = address.split(",")[-2].strip() if "," in address else ""
     website = None
 
-    # ── Strategy 1: SerpAPI ───────────────────────────────────────────────────
-    serp_data = await serp_search(f'"{vendor_name}" {city} email contact')
-    serp_organic = serp_data.get("organic_results", [])
+    # ── Strategy 1: SerpAPI Yelp email ───────────────────────────────────────
+    email = await serp_yelp_find_email(vendor_name, city)
+    if email:
+        return email, None
 
-    for result in serp_organic:
+    # ── Strategy 2: Google Maps Places website ────────────────────────────────
+    website = await google_maps_find_website(vendor_name, address)
+
+    # ── Strategy 3: SerpAPI Yelp website ─────────────────────────────────────
+    if not website:
+        website = await serp_yelp_find_website(vendor_name, city)
+
+    # ── Strategy 4: SerpAPI Google search ────────────────────────────────────
+    serp_data = await serp_search(f'"{vendor_name}" {city} email contact')
+    for result in serp_data.get("organic_results", []):
         emails = extract_emails_from_text(result.get("snippet", ""))
         if emails:
             print(f"[serp-snippet] {vendor_name}: {emails[0]}")
@@ -399,28 +521,12 @@ async def find_vendor_email(vendor_name: str, address: str) -> tuple:
             print(f"[serp-link] {vendor_name}: {emails[0]}")
             return emails[0], result.get("link")
 
-    # Find website via SerpAPI
-    serp_site = await serp_search(f'"{vendor_name}" {city} official website catering')
-    website = get_website_from_results(serp_site.get("organic_results", []))
-
-    # ── Strategy 2: DuckDuckGo fallback ──────────────────────────────────────
-    ddg_results = await ddg_search(f'"{vendor_name}" {city} email contact catering')
-    for result in ddg_results:
-        emails = extract_emails_from_text(result.get("snippet", ""))
-        if emails:
-            print(f"[ddg-snippet] {vendor_name}: {emails[0]}")
-            return emails[0], result.get("link")
-        emails = extract_emails_from_text(result.get("link", ""))
-        if emails:
-            print(f"[ddg-link] {vendor_name}: {emails[0]}")
-            return emails[0], result.get("link")
-
-    # Find website via DDG if SerpAPI didn't find one
+    # Find website via SerpAPI Google if still not found
     if not website:
-        ddg_site = await ddg_search(f'"{vendor_name}" {city} official site')
-        website = get_website_from_results(ddg_site)
+        serp_site = await serp_search(f'"{vendor_name}" {city} official website catering')
+        website = get_website_from_results(serp_site.get("organic_results", []))
 
-    # ── Strategy 3: Scrape website ────────────────────────────────────────────
+    # ── Strategy 5: Scrape website ────────────────────────────────────────────
     if website:
         email = await scrape_email_from_website(website)
         if email:
@@ -430,7 +536,7 @@ async def find_vendor_email(vendor_name: str, address: str) -> tuple:
             else:
                 print(f"[scrape-fail] {email} doesn't match {website}, skipping")
 
-        # ── Strategy 4: Hunter.io on real domain ──────────────────────────────
+        # ── Strategy 6: Hunter.io on real domain ──────────────────────────────
         domain = urlparse(website).netloc.replace("www.", "")
         if domain:
             email = await hunter_find_email(domain)
@@ -438,6 +544,22 @@ async def find_vendor_email(vendor_name: str, address: str) -> tuple:
                 return email, website
             elif email:
                 print(f"[hunter-fail] {email} doesn't match {website}, skipping")
+
+    # ── Strategy 7: DuckDuckGo fallback ──────────────────────────────────────
+    try:
+        ddg_url = f"https://html.duckduckgo.com/html/?q={quote_plus(f'{vendor_name} {city} email contact catering')}"
+        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+            resp = await client.get(ddg_url, headers={**HEADERS, "Referer": "https://duckduckgo.com/"})
+            if resp.status_code == 200:
+                snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', resp.text, re.DOTALL)
+                for snippet in snippets:
+                    clean = re.sub(r'<[^>]+>', '', snippet)
+                    emails = extract_emails_from_text(clean)
+                    if emails:
+                        print(f"[ddg] {vendor_name}: {emails[0]}")
+                        return emails[0], website
+    except Exception as e:
+        print(f"[ddg error] {e}")
 
     print(f"[email] Nothing found for {vendor_name}")
     return None, website
@@ -587,19 +709,21 @@ async def debug_email(payload: dict):
     results = {
         "serp_api_key_set": bool(SERP_API_KEY),
         "hunter_api_key_set": bool(HUNTER_API_KEY),
+        "google_maps_key_set": bool(GOOGLE_MAPS_API_KEY),
     }
 
-    query1 = f'"{name}" {city} email contact'
-    results["serp_query"] = query1
-    data1 = await serp_search(query1)
-    results["serp_results"] = [
-        {"title": r.get("title"), "snippet": r.get("snippet"), "link": r.get("link")}
-        for r in data1.get("organic_results", [])[:3]
-    ]
+    # Test Google Maps
+    gmaps_website = await google_maps_find_website(name, address)
+    results["google_maps_website"] = gmaps_website
 
-    ddg_results = await ddg_search(f'"{name}" {city} email contact catering')
-    results["ddg_results"] = ddg_results[:3]
+    # Test SerpAPI Yelp
+    yelp_website = await serp_yelp_find_website(name, city)
+    results["serp_yelp_website"] = yelp_website
 
+    yelp_email = await serp_yelp_find_email(name, city)
+    results["serp_yelp_email"] = yelp_email
+
+    # Full pipeline
     email, website = await find_vendor_email(name, address)
     results["final_email"] = email
     results["final_website"] = website

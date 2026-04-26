@@ -65,12 +65,6 @@ Your goals in early conversations:
 When you have enough info, tell them:
 - You'll be in touch when you find a relevant match
 - Mention upcoming events if relevant
-- Be specific: "I think you'd really click with someone who's also building in the health space — I'll keep an eye out"
-
-When introducing matches (you'll receive a MATCH_INTRO message with details):
-- Explain specifically WHY these two people should meet
-- Give them a fun ice-breaker or talking point
-- If there's an upcoming event, tell them to find each other there
 
 Current date: """ + datetime.now().strftime("%B %d, %Y") + """
 
@@ -170,7 +164,7 @@ def rank_vendors(vendors: list, search_params: dict) -> list:
     return sorted(vendors, key=lambda v: v["score"], reverse=True)
 
 
-# ── email extraction ──────────────────────────────────────────────────────────
+# ── email extraction & validation ─────────────────────────────────────────────
 EMAIL_PATTERN = re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b')
 
 IGNORE_DOMAINS = {
@@ -189,6 +183,8 @@ IGNORE_DOMAINS = {
     "doordash.com", "grubhub.com", "ubereats.com", "tripadvisor.com",
     "opentable.com", "resy.com", "thumbtack.com",
     "duckduckgo.com", "bing.com",
+    # Known false positive sources
+    "giftly.com", "giggster.com", "heathercoros.com",
     "png", "jpg", "jpeg", "gif", "webp", "svg", "pdf", "css", "js",
 }
 
@@ -205,7 +201,7 @@ SKIP_DOMAINS = {
     "doordash.com", "grubhub.com", "ubereats.com", "tripadvisor.com",
     "yellowpages.com", "bbb.org", "google.com", "yelp.to",
     "duckduckgo.com", "bing.com", "zoominfo.com", "manta.com",
-    "chamberofcommerce.com", "mapquest.com",
+    "chamberofcommerce.com", "mapquest.com", "giftly.com", "giggster.com",
 }
 
 
@@ -241,7 +237,7 @@ def extract_emails_from_text(text: str) -> list:
 
 
 def email_matches_website(email: str, website: str) -> bool:
-    """Check if email domain relates to the website domain."""
+    """Email domain must relate to the website domain."""
     if not email or not website:
         return False
     email_domain = email.split("@")[-1].replace("www.", "")
@@ -250,13 +246,20 @@ def email_matches_website(email: str, website: str) -> bool:
 
 
 def email_matches_vendor(email: str, vendor_name: str) -> bool:
-    """Check if email domain contains meaningful words from the vendor name."""
+    """Email domain must contain meaningful words from the vendor name."""
     if not email or not vendor_name:
         return False
     email_domain = email.split("@")[-1].replace("www.", "").split(".")[0]
     vendor_clean = re.sub(r'[^a-z0-9]', '', vendor_name.lower())
-    # Check if first 5+ chars of cleaned vendor name appear in email domain
     return len(vendor_clean) >= 4 and vendor_clean[:5] in email_domain
+
+
+def is_valid_email(email: str, vendor_name: str, website: str | None) -> bool:
+    """
+    Central sanity check — an email is valid if it matches
+    either the vendor's website domain OR the vendor's name.
+    """
+    return email_matches_website(email, website) or email_matches_vendor(email, vendor_name)
 
 
 def get_website_from_results(results: list) -> str | None:
@@ -270,6 +273,7 @@ def get_website_from_results(results: list) -> str | None:
 
 # ── Apollo.io ─────────────────────────────────────────────────────────────────
 async def apollo_find_email(vendor_name: str, address: str) -> tuple:
+    """Apollo.io organization + people search. Requires paid plan for org search."""
     if not APOLLO_API_KEY:
         return None, None
 
@@ -292,6 +296,10 @@ async def apollo_find_email(vendor_name: str, address: str) -> tuple:
                     "per_page": 3,
                 },
             )
+
+            if resp.status_code == 403:
+                # Free plan — silently skip, don't spam logs
+                return None, None
 
             if resp.status_code != 200:
                 print(f"[apollo] Search failed: {resp.status_code}")
@@ -373,7 +381,6 @@ async def google_maps_find_website(vendor_name: str, address: str) -> str | None
             place_id = results[0].get("place_id")
             if not place_id:
                 return None
-
             details_resp = await client.get(
                 "https://maps.googleapis.com/maps/api/place/details/json",
                 params={"place_id": place_id, "fields": "website,name", "key": GOOGLE_MAPS_API_KEY},
@@ -475,22 +482,16 @@ async def scrape_email_from_website(website_url: str) -> str | None:
 # ── main email finder ─────────────────────────────────────────────────────────
 async def find_vendor_email(vendor_name: str, address: str) -> tuple:
     """
-    8-strategy email finder — all results pass domain/vendor sanity checks.
-    1. Apollo.io — B2B contact database
-    2. SerpAPI Yelp engine — structured Yelp listing data
-    3. Google Maps Places API — website from Maps structured data
-    4. SerpAPI Google snippets — email in search results
-    5. Website scraping — visit their site pages
-    6. Hunter.io — domain search on real website
-    7. DuckDuckGo — free fallback (with sanity check)
+    8-strategy pipeline. ALL results pass is_valid_email() sanity check
+    before being returned — email must match vendor name or website domain.
     """
     city = address.split(",")[-2].strip() if "," in address else ""
     website = None
 
     # ── 1: Apollo.io ──────────────────────────────────────────────────────────
     apollo_email, apollo_website = await apollo_find_email(vendor_name, address)
-    if apollo_email:
-        return apollo_email, apollo_website or website
+    if apollo_email and is_valid_email(apollo_email, vendor_name, apollo_website):
+        return apollo_email, apollo_website
     if apollo_website:
         website = apollo_website
 
@@ -501,10 +502,10 @@ async def find_vendor_email(vendor_name: str, address: str) -> tuple:
         vendor_words = [w for w in vendor_name.lower().split() if len(w) > 3]
         if any(w in result_name for w in vendor_words):
             text = " ".join([result.get("snippet", ""), result.get("description", ""), str(result.get("contact", {}))])
-            emails = extract_emails_from_text(text)
-            if emails:
-                print(f"[serp-yelp] {vendor_name}: {emails[0]}")
-                return emails[0], website
+            for email in extract_emails_from_text(text):
+                if is_valid_email(email, vendor_name, website):
+                    print(f"[serp-yelp] {vendor_name}: {email}")
+                    return email, website
             if not website and result.get("website"):
                 website = result["website"].rstrip("/")
 
@@ -512,18 +513,23 @@ async def find_vendor_email(vendor_name: str, address: str) -> tuple:
     if not website:
         website = await google_maps_find_website(vendor_name, address)
 
-    # ── 4: SerpAPI Google snippets ────────────────────────────────────────────
+    # ── 4: SerpAPI Google snippets — WITH sanity check ────────────────────────
     serp_data = await serp_search(f'"{vendor_name}" {city} email contact')
     for result in serp_data.get("organic_results", []):
-        emails = extract_emails_from_text(result.get("snippet", ""))
-        if emails:
-            print(f"[serp-snippet] {vendor_name}: {emails[0]}")
-            return emails[0], website or result.get("link")
-        emails = extract_emails_from_text(result.get("link", ""))
-        if emails:
-            print(f"[serp-link] {vendor_name}: {emails[0]}")
-            return emails[0], website or result.get("link")
+        # Check snippet
+        for email in extract_emails_from_text(result.get("snippet", "")):
+            if is_valid_email(email, vendor_name, website):
+                print(f"[serp-snippet] {vendor_name}: {email}")
+                return email, website or result.get("link")
+            else:
+                print(f"[serp-snippet-fail] {email} rejected for {vendor_name}")
+        # Check link
+        for email in extract_emails_from_text(result.get("link", "")):
+            if is_valid_email(email, vendor_name, website):
+                print(f"[serp-link] {vendor_name}: {email}")
+                return email, website or result.get("link")
 
+    # Find website from SerpAPI if still none
     if not website:
         serp_site = await serp_search(f'"{vendor_name}" {city} official website catering')
         website = get_website_from_results(serp_site.get("organic_results", []))
@@ -531,23 +537,22 @@ async def find_vendor_email(vendor_name: str, address: str) -> tuple:
     # ── 5: Scrape website ─────────────────────────────────────────────────────
     if website:
         email = await scrape_email_from_website(website)
-        if email:
-            if email_matches_website(email, website):
-                print(f"[scrape] {vendor_name}: {email}")
-                return email, website
-            else:
-                print(f"[scrape-fail] {email} doesn't match {website}, skipping")
+        if email and is_valid_email(email, vendor_name, website):
+            print(f"[scrape] {vendor_name}: {email}")
+            return email, website
+        elif email:
+            print(f"[scrape-fail] {email} rejected for {vendor_name}")
 
         # ── 6: Hunter.io ──────────────────────────────────────────────────────
         domain = urlparse(website).netloc.replace("www.", "")
         if domain:
             email = await hunter_find_email(domain)
-            if email and email_matches_website(email, website):
+            if email and is_valid_email(email, vendor_name, website):
                 return email, website
             elif email:
-                print(f"[hunter-fail] {email} doesn't match {website}, skipping")
+                print(f"[hunter-fail] {email} rejected for {vendor_name}")
 
-    # ── 7: DuckDuckGo with sanity check ──────────────────────────────────────
+    # ── 7: DuckDuckGo — WITH sanity check ────────────────────────────────────
     try:
         ddg_url = f"https://html.duckduckgo.com/html/?q={quote_plus(f'{vendor_name} {city} email contact catering')}"
         async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
@@ -556,16 +561,12 @@ async def find_vendor_email(vendor_name: str, address: str) -> tuple:
                 snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', resp.text, re.DOTALL)
                 for snippet in snippets:
                     clean_text = re.sub(r'<[^>]+>', '', snippet)
-                    emails = extract_emails_from_text(clean_text)
-                    if emails:
-                        email_candidate = emails[0]
-                        # Sanity check: email must relate to vendor or website
-                        if (website and email_matches_website(email_candidate, website)) or \
-                           email_matches_vendor(email_candidate, vendor_name):
-                            print(f"[ddg] {vendor_name}: {email_candidate}")
-                            return email_candidate, website
+                    for email in extract_emails_from_text(clean_text):
+                        if is_valid_email(email, vendor_name, website):
+                            print(f"[ddg] {vendor_name}: {email}")
+                            return email, website
                         else:
-                            print(f"[ddg-fail] {email_candidate} rejected — unrelated to {vendor_name}")
+                            print(f"[ddg-fail] {email} rejected for {vendor_name}")
     except Exception as e:
         print(f"[ddg error] {e}")
 

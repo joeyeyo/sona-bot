@@ -241,11 +241,22 @@ def extract_emails_from_text(text: str) -> list:
 
 
 def email_matches_website(email: str, website: str) -> bool:
+    """Check if email domain relates to the website domain."""
     if not email or not website:
         return False
     email_domain = email.split("@")[-1].replace("www.", "")
     site_domain = urlparse(website).netloc.replace("www.", "")
     return email_domain in site_domain or site_domain in email_domain
+
+
+def email_matches_vendor(email: str, vendor_name: str) -> bool:
+    """Check if email domain contains meaningful words from the vendor name."""
+    if not email or not vendor_name:
+        return False
+    email_domain = email.split("@")[-1].replace("www.", "").split(".")[0]
+    vendor_clean = re.sub(r'[^a-z0-9]', '', vendor_name.lower())
+    # Check if first 5+ chars of cleaned vendor name appear in email domain
+    return len(vendor_clean) >= 4 and vendor_clean[:5] in email_domain
 
 
 def get_website_from_results(results: list) -> str | None:
@@ -259,14 +270,6 @@ def get_website_from_results(results: list) -> str | None:
 
 # ── Apollo.io ─────────────────────────────────────────────────────────────────
 async def apollo_find_email(vendor_name: str, address: str) -> tuple:
-    """
-    Search Apollo.io for a business by name and location.
-    Returns (email, website) — Apollo is the most comprehensive
-    B2B contact database and works well for small local businesses.
-
-    Uses the organizations/search endpoint to find the company,
-    then extracts contact email from the result.
-    """
     if not APOLLO_API_KEY:
         return None, None
 
@@ -275,7 +278,6 @@ async def apollo_find_email(vendor_name: str, address: str) -> tuple:
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            # Search for the organization
             resp = await client.post(
                 "https://api.apollo.io/v1/mixed_companies/search",
                 headers={
@@ -292,44 +294,35 @@ async def apollo_find_email(vendor_name: str, address: str) -> tuple:
             )
 
             if resp.status_code != 200:
-                print(f"[apollo] Search failed: {resp.status_code} {resp.text[:200]}")
+                print(f"[apollo] Search failed: {resp.status_code}")
                 return None, None
 
             data = resp.json()
             organizations = data.get("organizations", [])
-
             if not organizations:
-                print(f"[apollo] No organizations found for {vendor_name}")
                 return None, None
 
-            # Find best matching org
             best_org = None
             vendor_lower = vendor_name.lower()
             for org in organizations:
                 org_name = org.get("name", "").lower()
-                # Check for meaningful word overlap
                 vendor_words = [w for w in vendor_lower.split() if len(w) > 3]
                 if any(w in org_name for w in vendor_words):
                     best_org = org
                     break
-
             if not best_org:
-                best_org = organizations[0]  # Fall back to first result
+                best_org = organizations[0]
 
             website = best_org.get("website_url") or best_org.get("primary_domain")
             if website and not website.startswith("http"):
                 website = f"https://{website}"
 
-            # Try to get a contact email from the org
-            # Apollo may include contacts directly or we use the org email patterns
             org_id = best_org.get("id")
             email = None
 
-            # Check if Apollo returned any email directly
             if best_org.get("contact_emails"):
                 email = best_org["contact_emails"][0]
 
-            # Try people search for this org to find a contact email
             if not email and org_id:
                 people_resp = await client.post(
                     "https://api.apollo.io/v1/mixed_people/search",
@@ -345,11 +338,8 @@ async def apollo_find_email(vendor_name: str, address: str) -> tuple:
                         "person_titles": ["owner", "manager", "catering manager", "event coordinator", "director"],
                     },
                 )
-
                 if people_resp.status_code == 200:
-                    people_data = people_resp.json()
-                    people = people_data.get("people", [])
-                    for person in people:
+                    for person in people_resp.json().get("people", []):
                         person_email = person.get("email")
                         if person_email and "@" in person_email and "apollo" not in person_email:
                             email = person_email
@@ -412,19 +402,13 @@ async def serp_search(query: str) -> dict:
 
 
 async def serp_yelp_search(vendor_name: str, city: str) -> dict:
-    """SerpAPI Yelp engine — returns structured Yelp listing data."""
     if not SERP_API_KEY:
         return {}
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
                 "https://serpapi.com/search",
-                params={
-                    "engine": "yelp",
-                    "find_desc": vendor_name,
-                    "find_loc": city,
-                    "api_key": SERP_API_KEY,
-                },
+                params={"engine": "yelp", "find_desc": vendor_name, "find_loc": city, "api_key": SERP_API_KEY},
             )
             if resp.status_code == 200:
                 return resp.json()
@@ -491,53 +475,44 @@ async def scrape_email_from_website(website_url: str) -> str | None:
 # ── main email finder ─────────────────────────────────────────────────────────
 async def find_vendor_email(vendor_name: str, address: str) -> tuple:
     """
-    8-strategy email finder pipeline:
-    1. Apollo.io — most comprehensive B2B contact database
-    2. SerpAPI Yelp engine — email/website from Yelp listing data
-    3. Google Maps Places API — website from structured Maps data
-    4. SerpAPI Google — email in search snippets
+    8-strategy email finder — all results pass domain/vendor sanity checks.
+    1. Apollo.io — B2B contact database
+    2. SerpAPI Yelp engine — structured Yelp listing data
+    3. Google Maps Places API — website from Maps structured data
+    4. SerpAPI Google snippets — email in search results
     5. Website scraping — visit their site pages
     6. Hunter.io — domain search on real website
-    7. DuckDuckGo — free fallback search
-    8. Apollo website + Hunter — if Apollo found website but no email
+    7. DuckDuckGo — free fallback (with sanity check)
     """
     city = address.split(",")[-2].strip() if "," in address else ""
     website = None
 
-    # ── Strategy 1: Apollo.io ─────────────────────────────────────────────────
+    # ── 1: Apollo.io ──────────────────────────────────────────────────────────
     apollo_email, apollo_website = await apollo_find_email(vendor_name, address)
     if apollo_email:
         return apollo_email, apollo_website or website
     if apollo_website:
-        website = apollo_website  # Keep Apollo's website for later strategies
+        website = apollo_website
 
-    # ── Strategy 2: SerpAPI Yelp ──────────────────────────────────────────────
+    # ── 2: SerpAPI Yelp ───────────────────────────────────────────────────────
     yelp_data = await serp_yelp_search(vendor_name, city)
     for result in yelp_data.get("organic_results", []):
         result_name = result.get("name", "").lower()
         vendor_words = [w for w in vendor_name.lower().split() if len(w) > 3]
         if any(w in result_name for w in vendor_words):
-            # Check for email in all text fields
-            text = " ".join([
-                result.get("snippet", ""),
-                result.get("description", ""),
-                str(result.get("contact", {})),
-            ])
+            text = " ".join([result.get("snippet", ""), result.get("description", ""), str(result.get("contact", {}))])
             emails = extract_emails_from_text(text)
             if emails:
                 print(f"[serp-yelp] {vendor_name}: {emails[0]}")
                 return emails[0], website
-
-            # Grab website if we don't have one yet
             if not website and result.get("website"):
                 website = result["website"].rstrip("/")
-                print(f"[serp-yelp] Found website for {vendor_name}: {website}")
 
-    # ── Strategy 3: Google Maps Places ───────────────────────────────────────
+    # ── 3: Google Maps Places ─────────────────────────────────────────────────
     if not website:
         website = await google_maps_find_website(vendor_name, address)
 
-    # ── Strategy 4: SerpAPI Google snippets ──────────────────────────────────
+    # ── 4: SerpAPI Google snippets ────────────────────────────────────────────
     serp_data = await serp_search(f'"{vendor_name}" {city} email contact')
     for result in serp_data.get("organic_results", []):
         emails = extract_emails_from_text(result.get("snippet", ""))
@@ -549,12 +524,11 @@ async def find_vendor_email(vendor_name: str, address: str) -> tuple:
             print(f"[serp-link] {vendor_name}: {emails[0]}")
             return emails[0], website or result.get("link")
 
-    # Find website from SerpAPI Google if still none
     if not website:
         serp_site = await serp_search(f'"{vendor_name}" {city} official website catering')
         website = get_website_from_results(serp_site.get("organic_results", []))
 
-    # ── Strategy 5: Scrape website ────────────────────────────────────────────
+    # ── 5: Scrape website ─────────────────────────────────────────────────────
     if website:
         email = await scrape_email_from_website(website)
         if email:
@@ -562,18 +536,18 @@ async def find_vendor_email(vendor_name: str, address: str) -> tuple:
                 print(f"[scrape] {vendor_name}: {email}")
                 return email, website
             else:
-                print(f"[scrape-fail] {email} doesn't match {website}")
+                print(f"[scrape-fail] {email} doesn't match {website}, skipping")
 
-        # ── Strategy 6: Hunter.io on real domain ──────────────────────────────
+        # ── 6: Hunter.io ──────────────────────────────────────────────────────
         domain = urlparse(website).netloc.replace("www.", "")
         if domain:
             email = await hunter_find_email(domain)
             if email and email_matches_website(email, website):
                 return email, website
             elif email:
-                print(f"[hunter-fail] {email} doesn't match {website}")
+                print(f"[hunter-fail] {email} doesn't match {website}, skipping")
 
-    # ── Strategy 7: DuckDuckGo fallback ──────────────────────────────────────
+    # ── 7: DuckDuckGo with sanity check ──────────────────────────────────────
     try:
         ddg_url = f"https://html.duckduckgo.com/html/?q={quote_plus(f'{vendor_name} {city} email contact catering')}"
         async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
@@ -584,8 +558,14 @@ async def find_vendor_email(vendor_name: str, address: str) -> tuple:
                     clean_text = re.sub(r'<[^>]+>', '', snippet)
                     emails = extract_emails_from_text(clean_text)
                     if emails:
-                        print(f"[ddg] {vendor_name}: {emails[0]}")
-                        return emails[0], website
+                        email_candidate = emails[0]
+                        # Sanity check: email must relate to vendor or website
+                        if (website and email_matches_website(email_candidate, website)) or \
+                           email_matches_vendor(email_candidate, vendor_name):
+                            print(f"[ddg] {vendor_name}: {email_candidate}")
+                            return email_candidate, website
+                        else:
+                            print(f"[ddg-fail] {email_candidate} rejected — unrelated to {vendor_name}")
     except Exception as e:
         print(f"[ddg error] {e}")
 
@@ -737,19 +717,14 @@ async def debug_email(payload: dict):
         "gmaps_key_set": bool(GOOGLE_MAPS_API_KEY),
     }
 
-    # Test Apollo
     apollo_email, apollo_website = await apollo_find_email(name, address)
     results["apollo_email"] = apollo_email
     results["apollo_website"] = apollo_website
-
-    # Test Google Maps
     results["google_maps_website"] = await google_maps_find_website(name, address)
 
-    # Test SerpAPI Yelp
     yelp_data = await serp_yelp_search(name, city)
     results["serp_yelp_results"] = len(yelp_data.get("organic_results", []))
 
-    # Full pipeline
     email, website = await find_vendor_email(name, address)
     results["final_email"] = email
     results["final_website"] = website

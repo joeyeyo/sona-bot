@@ -152,31 +152,66 @@ def rank_vendors(vendors: list, search_params: dict) -> list:
     return sorted(vendors, key=lambda v: v["score"], reverse=True)
 
 
-# ── email extraction ──────────────────────────────────────────────────────────
+# ── domain lists ──────────────────────────────────────────────────────────────
 EMAIL_PATTERN = re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b')
 
 IGNORE_DOMAINS = {
+    # Analytics & tracking
     "sentry.io", "mapquest.com", "doubleclick.net", "googletagmanager.com",
     "googleapis.com", "gstatic.com", "cloudflare.com", "akamai.com",
     "newrelic.com", "segment.com", "mixpanel.com", "amplitude.com",
     "intercom.io", "zendesk.com", "hubspot.com", "mailchimp.com",
+    # Website builders
     "wixpress.com", "squarespace.com", "wordpress.com", "shopify.com",
     "weebly.com", "webflow.io", "godaddy.com",
+    # Generic/placeholder
     "example.com", "yourdomain.com", "email.com", "domain.com",
     "yoursite.com", "company.com",
+    # Big providers
     "google.com", "gmail.com", "yahoo.com", "hotmail.com", "outlook.com",
     "icloud.com", "me.com", "mac.com", "live.com",
+    # Social/aggregators
     "yelp.com", "facebook.com", "instagram.com", "twitter.com",
     "tiktok.com", "linkedin.com", "pinterest.com",
     "doordash.com", "grubhub.com", "ubereats.com", "tripadvisor.com",
     "opentable.com", "resy.com", "thumbtack.com",
     "duckduckgo.com", "bing.com",
-    "giftly.com", "giggster.com", "heathercoros.com",
-    "pandaexpressed.com",
+    # Known false positive sources
+    "giftly.com", "giggster.com", "heathercoros.com", "pandaexpressed.com",
+    "escholarship.org", "partyslate.com",
+    # File extensions
     "png", "jpg", "jpeg", "gif", "webp", "svg", "pdf", "css", "js",
 }
 
-PRIORITY_LOCAL_PARTS = ["contact", "info", "hello", "events", "booking", "catering", "hire", "enquir", "inquir"]
+# Domains that are directories/aggregators — never use as a vendor's website
+DIRECTORY_DOMAINS = {
+    # Vendor directories & marketplaces
+    "partyslate.com", "theknot.com", "weddingwire.com", "junebugweddings.com",
+    "stylemepretty.com", "greenweddingshoes.com", "borrowed-blu.com",
+    "thumbtack.com", "bark.com", "houzz.com", "expertise.com",
+    "gigsalad.com", "gigmasters.com", "eventsquid.com",
+    "styleseat.com", "vagaro.com", "booksy.com",
+    "eventective.com", "venuelook.com", "peerspace.com",
+    "tagvenue.com", "splacer.co", "breather.com",
+    # Review/listing sites
+    "yelp.com", "tripadvisor.com", "google.com", "bing.com",
+    "yellowpages.com", "bbb.org", "manta.com", "zoominfo.com",
+    "chamberofcommerce.com", "mapquest.com",
+    # Food delivery
+    "doordash.com", "grubhub.com", "ubereats.com", "postmates.com",
+    "caviar.com", "seamless.com", "toasttab.com",
+    # Social
+    "facebook.com", "instagram.com", "twitter.com", "linkedin.com",
+    "pinterest.com", "tiktok.com",
+    # Academic/misc
+    "escholarship.org", "academia.edu", "researchgate.net",
+    # Other known false positives
+    "giftly.com", "giggster.com", "heathercoros.com",
+    "unicorn-productions.us",  # This one was real — remove if needed
+}
+
+PRIORITY_LOCAL_PARTS = ["contact", "info", "hello", "events", "booking", "catering",
+                         "hire", "enquir", "inquir", "photo", "studio"]
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -184,13 +219,13 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.5",
 }
 
-SKIP_DOMAINS = {
-    "yelp.com", "facebook.com", "instagram.com", "twitter.com",
-    "doordash.com", "grubhub.com", "ubereats.com", "tripadvisor.com",
-    "yellowpages.com", "bbb.org", "google.com", "yelp.to",
-    "duckduckgo.com", "bing.com", "zoominfo.com", "manta.com",
-    "chamberofcommerce.com", "mapquest.com", "giftly.com", "giggster.com",
-}
+
+def is_directory_site(url: str) -> bool:
+    """Returns True if the URL belongs to a vendor directory or aggregator."""
+    if not url:
+        return False
+    domain = urlparse(url).netloc.replace("www.", "")
+    return any(d in domain for d in DIRECTORY_DOMAINS)
 
 
 def extract_emails_from_text(text: str) -> list:
@@ -207,7 +242,7 @@ def extract_emails_from_text(text: str) -> list:
     seen = set()
     for email in all_emails:
         email = email.lower().strip().rstrip(".,;")
-        # Strip www. from email domain (e.g. catering@www.site.com → catering@site.com)
+        # Strip www. from email domain
         parts = email.split("@")
         if len(parts) == 2 and parts[1].startswith("www."):
             email = parts[0] + "@" + parts[1][4:]
@@ -238,21 +273,19 @@ def email_matches_website(email: str, website: str) -> bool:
 
 
 def is_valid_email(email: str, website: str | None) -> bool:
-    """
-    Strict validation: only accept an email if its domain matches
-    the vendor's confirmed website. No website = no email from snippets.
-    This eliminates false positives from unrelated businesses in search results.
-    """
+    """Only accept emails whose domain matches the vendor's confirmed website."""
     if not email or not website:
+        return False
+    if is_directory_site(website):
         return False
     return email_matches_website(email, website)
 
 
 def get_website_from_results(results: list) -> str | None:
+    """Extract first non-directory, non-skipped website from search results."""
     for result in results:
         link = result.get("link", "")
-        domain = urlparse(link).netloc.replace("www.", "")
-        if link and not any(skip in domain for skip in SKIP_DOMAINS):
+        if link and not is_directory_site(link):
             return link.split("?")[0].rstrip("/")
     return None
 
@@ -274,7 +307,7 @@ async def apollo_find_email(vendor_name: str, address: str) -> tuple:
                     "page": 1, "per_page": 3,
                 },
             )
-            if resp.status_code == 403:
+            if resp.status_code in (403, 402):
                 return None, None
             if resp.status_code != 200:
                 return None, None
@@ -296,6 +329,8 @@ async def apollo_find_email(vendor_name: str, address: str) -> tuple:
             website = best_org.get("website_url") or best_org.get("primary_domain")
             if website and not website.startswith("http"):
                 website = f"https://{website}"
+            if website and is_directory_site(website):
+                website = None
 
             email = None
             if best_org.get("contact_emails"):
@@ -352,8 +387,12 @@ async def google_maps_find_website(vendor_name: str, address: str) -> str | None
                 return None
             website = details_resp.json().get("result", {}).get("website")
             if website:
+                website = website.rstrip("/")
+                if is_directory_site(website):
+                    print(f"[gmaps] {vendor_name}: rejected directory site {website}")
+                    return None
                 print(f"[gmaps] {vendor_name}: {website}")
-                return website.rstrip("/")
+                return website
     except Exception as e:
         print(f"[gmaps error] {vendor_name}: {e}")
     return None
@@ -404,7 +443,7 @@ async def hunter_find_email(domain: str) -> str | None:
             if not emails:
                 pattern = data.get("data", {}).get("pattern")
                 if pattern:
-                    for prefix in ["info", "contact", "hello", "events"]:
+                    for prefix in ["info", "contact", "hello", "events", "book"]:
                         candidate = f"{prefix}@{domain}"
                         if candidate.split("@")[-1] not in IGNORE_DOMAINS:
                             return candidate
@@ -419,7 +458,6 @@ async def hunter_find_email(domain: str) -> str | None:
 
             emails_sorted = sorted(emails, key=email_priority, reverse=True)
             best = emails_sorted[0].get("value")
-            # Make sure Hunter result isn't from ignore list
             if best and best.split("@")[-1] in IGNORE_DOMAINS:
                 return None
             print(f"[hunter] {best} for {domain}")
@@ -430,7 +468,7 @@ async def hunter_find_email(domain: str) -> str | None:
 
 
 async def scrape_email_from_website(website_url: str) -> str | None:
-    if not website_url:
+    if not website_url or is_directory_site(website_url):
         return None
     base = website_url.rstrip("/")
     pages_to_check = [base, f"{base}/contact", f"{base}/contact-us", f"{base}/about"]
@@ -450,30 +488,28 @@ async def scrape_email_from_website(website_url: str) -> str | None:
 # ── main email finder ─────────────────────────────────────────────────────────
 async def find_vendor_email(vendor_name: str, address: str) -> tuple:
     """
-    Pipeline focused on finding the vendor's WEBSITE first,
-    then only accepting emails that match that website's domain.
-    This eliminates false positives from unrelated businesses in search results.
+    Two-phase pipeline:
 
-    Phase 1 — Find website:
+    Phase 1 — Find the vendor's REAL website (not a directory):
       1. Apollo.io
-      2. Google Maps Places API
+      2. Google Maps Places API (rejects directory sites)
       3. SerpAPI Yelp engine
-      4. SerpAPI Google
+      4. SerpAPI Google (rejects directory sites)
 
-    Phase 2 — Find email from confirmed website:
+    Phase 2 — Find email from confirmed website only:
       5. Scrape website pages
       6. Hunter.io domain search
-      7. SerpAPI Google snippets (only if email matches website)
-      8. DuckDuckGo (only if email matches website)
+      7. SerpAPI Google snippets (must match website domain)
+      8. DuckDuckGo (must match website domain)
     """
     city = address.split(",")[-2].strip() if "," in address else ""
     website = None
 
-    # ── Phase 1: Find website ─────────────────────────────────────────────────
+    # ── Phase 1: Find real website ────────────────────────────────────────────
 
     # 1. Apollo
     apollo_email, apollo_website = await apollo_find_email(vendor_name, address)
-    if apollo_website:
+    if apollo_website and not is_directory_site(apollo_website):
         website = apollo_website
     if apollo_email and is_valid_email(apollo_email, website):
         return apollo_email, website
@@ -489,19 +525,21 @@ async def find_vendor_email(vendor_name: str, address: str) -> tuple:
             result_name = result.get("name", "").lower()
             vendor_words = [w for w in vendor_name.lower().split() if len(w) > 3]
             if any(w in result_name for w in vendor_words):
-                if result.get("website"):
-                    website = result["website"].rstrip("/")
+                candidate = result.get("website", "")
+                if candidate and not is_directory_site(candidate):
+                    website = candidate.rstrip("/")
+                    print(f"[serp-yelp] {vendor_name} website: {website}")
                     break
 
     # 4. SerpAPI Google for website
     if not website:
-        serp_site = await serp_search(f'"{vendor_name}" {city} official website catering')
+        serp_site = await serp_search(f'"{vendor_name}" {city} official website')
         website = get_website_from_results(serp_site.get("organic_results", []))
 
-    # ── Phase 2: Find email from confirmed website ────────────────────────────
+    # ── Phase 2: Find email from confirmed real website ───────────────────────
 
     if not website:
-        print(f"[email] No website found for {vendor_name} — skipping email search")
+        print(f"[email] No real website found for {vendor_name}")
         return None, None
 
     # 5. Scrape website
@@ -521,7 +559,7 @@ async def find_vendor_email(vendor_name: str, address: str) -> tuple:
         elif email:
             print(f"[hunter-fail] {email} doesn't match {website}")
 
-    # 7. SerpAPI Google snippets — only accept if matches website
+    # 7. SerpAPI Google snippets
     serp_data = await serp_search(f'"{vendor_name}" {city} email contact')
     for result in serp_data.get("organic_results", []):
         for email in extract_emails_from_text(result.get("snippet", "") + " " + result.get("link", "")):
@@ -529,11 +567,11 @@ async def find_vendor_email(vendor_name: str, address: str) -> tuple:
                 print(f"[serp-snippet] {vendor_name}: {email}")
                 return email, website
             else:
-                print(f"[serp-snippet-fail] {email} rejected (no website match)")
+                print(f"[serp-snippet-fail] {email} rejected")
 
-    # 8. DuckDuckGo — only accept if matches website
+    # 8. DuckDuckGo
     try:
-        ddg_url = f"https://html.duckduckgo.com/html/?q={quote_plus(f'{vendor_name} {city} email contact catering')}"
+        ddg_url = f"https://html.duckduckgo.com/html/?q={quote_plus(f'{vendor_name} {city} email contact')}"
         async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
             resp = await client.get(ddg_url, headers={**HEADERS, "Referer": "https://duckduckgo.com/"})
             if resp.status_code == 200:
@@ -544,7 +582,7 @@ async def find_vendor_email(vendor_name: str, address: str) -> tuple:
                             print(f"[ddg] {vendor_name}: {email}")
                             return email, website
                         else:
-                            print(f"[ddg-fail] {email} rejected (no website match)")
+                            print(f"[ddg-fail] {email} rejected")
     except Exception as e:
         print(f"[ddg error] {e}")
 
@@ -656,7 +694,8 @@ No markdown, no explanation."""
         "vendors": vendors,
         "total": len(vendors),
         "emails_found": sum(1 for v in vendors if v.get("email")),
-        "query": {"category": category, "location": location, "budget": budget, "guest_count": guest_count, "min_rating": min_rating}
+        "query": {"category": category, "location": location, "budget": budget,
+                  "guest_count": guest_count, "min_rating": min_rating}
     }
 
 
@@ -674,7 +713,8 @@ async def send_vendor_email(payload: dict):
     try:
         result = await send_gmail(to, subject, body)
         print(f"[gmail] Sent to {vendor_name} <{to}>: {subject}")
-        return {"status": "sent", "to": to, "vendor_name": vendor_name, "subject": subject, "message_id": result.get("message_id")}
+        return {"status": "sent", "to": to, "vendor_name": vendor_name,
+                "subject": subject, "message_id": result.get("message_id")}
     except Exception as e:
         print(f"[gmail error] {e}")
         return {"error": str(e)}
@@ -712,7 +752,8 @@ async def debug_email(payload: dict):
 # ── admin ─────────────────────────────────────────────────────────────────────
 @app.get("/admin/users")
 async def list_users():
-    return {phone: {"joined_at": d["joined_at"], "message_count": len(d["messages"]), "profile": d["profile"]} for phone, d in conversations.items()}
+    return {phone: {"joined_at": d["joined_at"], "message_count": len(d["messages"]),
+                    "profile": d["profile"]} for phone, d in conversations.items()}
 
 
 @app.get("/admin/conversation/{phone_number}")

@@ -42,55 +42,315 @@ GMAIL_CLIENT_ID = os.environ.get("GMAIL_CLIENT_ID", "")
 GMAIL_CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET", "")
 GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN", "")
 GMAIL_SENDER = os.environ.get("GMAIL_SENDER", "yeh.joseph@gmail.com")
-
-# ── in-memory store ───────────────────────────────────────────────────────────
-conversations: dict = {}
-
-# ── Sona system prompt ────────────────────────────────────────────────────────
-SONA_SYSTEM_PROMPT = """You are Sona, a warm and perceptive networking concierge. You help people meet other people who are genuinely relevant to them — professionally and personally. You work for a company that hosts in-person events where members can meet face-to-face.
-
-Your personality:
-- Warm, curious, and a little playful — like a smart friend who happens to know everyone
-- You ask ONE question at a time, never overwhelm people with forms
-- You remember everything someone tells you and reference it naturally
-- You're honest if you don't have a match yet — you say "I'm keeping an eye out for you"
-
-Current date: """ + datetime.now().strftime("%B %d, %Y") + """
-
-Keep responses SHORT — this is WhatsApp, not email. 2-4 sentences max per message. No bullet points or markdown formatting. Just natural, conversational text."""
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
-def get_or_create_session(phone: str) -> dict:
-    if phone not in conversations:
-        conversations[phone] = {
-            "messages": [],
-            "profile": {},
-            "joined_at": datetime.now().isoformat(),
-        }
-    return conversations[phone]
+# ── Supabase helpers ──────────────────────────────────────────────────────────
+def supa_headers():
+    return {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
 
 
-def chat_with_sona(phone: str, user_message: str) -> str:
-    session = get_or_create_session(phone)
-    session["messages"].append({"role": "user", "content": user_message})
+async def supa_get(table: str, filters: dict) -> list:
+    params = "&".join(f"{k}=eq.{v}" for k, v in filters.items())
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/{table}?{params}",
+            headers=supa_headers(),
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    return []
+
+
+async def supa_insert(table: str, data: dict) -> dict | None:
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        resp = await client.post(
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            headers=supa_headers(),
+            json=data,
+        )
+        if resp.status_code in (200, 201):
+            result = resp.json()
+            return result[0] if result else None
+    return None
+
+
+async def supa_update(table: str, filters: dict, data: dict) -> dict | None:
+    params = "&".join(f"{k}=eq.{v}" for k, v in filters.items())
+    data["updated_at"] = datetime.now().isoformat()
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        resp = await client.patch(
+            f"{SUPABASE_URL}/rest/v1/{table}?{params}",
+            headers=supa_headers(),
+            json=data,
+        )
+        if resp.status_code == 200:
+            result = resp.json()
+            return result[0] if result else None
+    return None
+
+
+async def get_or_create_guest(phone: str) -> dict:
+    rows = await supa_get("guests", {"phone": phone})
+    if rows:
+        return rows[0]
+    new_guest = await supa_insert("guests", {"phone": phone})
+    return new_guest or {"phone": phone, "stage": "intro"}
+
+
+async def get_or_create_conversation(phone: str) -> dict:
+    rows = await supa_get("conversations", {"phone": phone})
+    if rows:
+        return rows[0]
+    new_conv = await supa_insert("conversations", {
+        "phone": phone,
+        "messages": [],
+        "stage": "intro",
+    })
+    return new_conv or {"phone": phone, "messages": [], "stage": "intro"}
+
+
+async def save_conversation(phone: str, messages: list, stage: str):
+    rows = await supa_get("conversations", {"phone": phone})
+    if rows:
+        await supa_update("conversations", {"phone": phone}, {
+            "messages": messages,
+            "stage": stage,
+        })
+    else:
+        await supa_insert("conversations", {
+            "phone": phone,
+            "messages": messages,
+            "stage": stage,
+        })
+
+
+async def get_active_event() -> dict | None:
+    """Get the most recently created event."""
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/events?order=created_at.desc&limit=1",
+            headers=supa_headers(),
+        )
+        if resp.status_code == 200:
+            rows = resp.json()
+            return rows[0] if rows else None
+    return None
+
+
+async def get_confirmed_guests(event_id: str) -> list:
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/guests?event_id=eq.{event_id}&rsvp_status=eq.confirmed",
+            headers=supa_headers(),
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    return []
+
+
+# ── Sona onboarding system prompt ─────────────────────────────────────────────
+def build_onboarding_prompt(event: dict | None, stage: str, guest: dict) -> str:
+    event_info = ""
+    if event:
+        event_info = f"""
+ACTIVE EVENT:
+- Name: {event.get('name', 'An exclusive event')}
+- Date: {event.get('date', 'TBD')}
+- Venue: {event.get('venue', 'TBD')} in {event.get('city', 'Los Angeles')}
+- Expected guests: {event.get('guest_count', '~30')}
+- Vibe: {event.get('vibe', 'Intimate, curated networking')}
+- Audience: {event.get('audience', 'Asian tech founders and operators')}
+- Hosts: {event.get('host_name', 'Joe and Eric')}
+"""
+
+    guest_info = f"""
+GUEST SO FAR:
+- Name: {guest.get('name', 'unknown')}
+- LinkedIn: {guest.get('linkedin_url', 'not provided')}
+- What they do: {guest.get('what_they_do', 'unknown')}
+- Who they want to meet: {guest.get('who_they_want_to_meet', 'unknown')}
+- RSVP status: {guest.get('rsvp_status', 'pending')}
+"""
+
+    return f"""You are Sona, an AI concierge for an exclusive invite-only event community in Los Angeles run by Joe Yeh and Eric Tsai.
+
+Your job is to have a SHORT, warm, conversational intake with potential guests — figure out who they are and what they're looking for, then generate a personalized invite that makes them feel like this event was made for them.
+
+{event_info}
+{guest_info}
+
+CURRENT STAGE: {stage}
+
+ONBOARDING STAGES IN ORDER:
+1. intro — Warm greeting, explain you're reaching out on behalf of Joe. Ask for their LinkedIn URL first.
+2. what_they_do — Ask what they're working on / building right now (1 question only)
+3. who_to_meet — Ask who they're most trying to connect with (founders, investors, operators, talent, etc.)
+4. interests — Ask one lightweight personal question (what do you do outside of work, what are you into lately)
+5. generate_invite — Generate their personalized invite based on everything collected
+6. rsvp — They've seen the invite, handle yes/no/maybe response
+7. confirmed — They said yes, send event details and what to expect
+8. declined — They said no, be gracious
+
+RULES:
+- Ask ONE question at a time — never multiple questions in one message
+- Keep messages SHORT — this is WhatsApp, 2-4 sentences max
+- Be warm and human, not salesy or corporate
+- When generating the invite (stage 5): write a compelling 3-4 sentence personalized message that explains exactly why THIS person should come based on what they told you. Reference specific things they said. End with "You in?"
+- When they RSVP yes: confirm warmly, tell them the date/venue, say you'll send more details closer to the event
+- Do NOT mention you are an AI unless directly asked
+
+LINKEDIN EXTRACTION:
+When you receive a LinkedIn URL, acknowledge it and move to the next question. Do not try to look it up — the system will handle that separately.
+
+Respond naturally as Sona. No bullet points, no markdown. Just conversational text."""
+
+
+# ── Onboarding stage detection ─────────────────────────────────────────────────
+def detect_next_stage(current_stage: str, user_message: str, guest: dict) -> str:
+    """Advance the stage based on what we've collected."""
+    msg_lower = user_message.lower().strip()
+
+    if current_stage == "intro":
+        # Check if they gave us a LinkedIn URL
+        if "linkedin.com" in msg_lower or "linked.in" in msg_lower:
+            return "what_they_do"
+        return "intro"
+
+    if current_stage == "what_they_do":
+        if len(user_message) > 10:  # They answered
+            return "who_to_meet"
+        return "what_they_do"
+
+    if current_stage == "who_to_meet":
+        if len(user_message) > 5:
+            return "interests"
+        return "who_to_meet"
+
+    if current_stage == "interests":
+        if len(user_message) > 5:
+            return "generate_invite"
+        return "interests"
+
+    if current_stage == "generate_invite":
+        # After generating invite, move to rsvp
+        return "rsvp"
+
+    if current_stage == "rsvp":
+        yes_signals = ["yes", "yeah", "yep", "sure", "in", "absolutely", "definitely", "count me", "i'm in", "im in", "sounds good", "let's go", "lets go"]
+        no_signals = ["no", "nope", "can't", "cant", "won't", "wont", "pass", "not this time", "maybe next"]
+        if any(s in msg_lower for s in yes_signals):
+            return "confirmed"
+        if any(s in msg_lower for s in no_signals):
+            return "declined"
+        return "rsvp"
+
+    return current_stage
+
+
+def extract_linkedin_url(text: str) -> str | None:
+    patterns = [
+        r'https?://(?:www\.)?linkedin\.com/in/[\w\-]+/?',
+        r'linkedin\.com/in/[\w\-]+/?',
+        r'linked\.in/[\w\-]+/?',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            url = match.group()
+            if not url.startswith("http"):
+                url = "https://" + url
+            return url
+    return None
+
+
+# ── Main WhatsApp onboarding handler ─────────────────────────────────────────
+async def handle_guest_onboarding(phone: str, user_message: str) -> str:
+    """
+    Stateful onboarding conversation stored in Supabase.
+    Guides guest through 5 questions then generates personalized invite.
+    """
+    # Load state from Supabase
+    conv = await get_or_create_conversation(phone)
+    guest = await get_or_create_guest(phone)
+    event = await get_active_event()
+
+    messages = conv.get("messages") or []
+    current_stage = conv.get("stage") or "intro"
+
+    # Extract LinkedIn URL if present
+    linkedin_url = extract_linkedin_url(user_message)
+    if linkedin_url and not guest.get("linkedin_url"):
+        await supa_update("guests", {"phone": phone}, {"linkedin_url": linkedin_url})
+        guest["linkedin_url"] = linkedin_url
+
+    # Detect stage transitions and update guest data
+    next_stage = detect_next_stage(current_stage, user_message, guest)
+
+    # Save answers to guest profile based on stage
+    if current_stage == "what_they_do" and len(user_message) > 10:
+        await supa_update("guests", {"phone": phone}, {"what_they_do": user_message})
+        guest["what_they_do"] = user_message
+
+    elif current_stage == "who_to_meet" and len(user_message) > 5:
+        await supa_update("guests", {"phone": phone}, {"who_they_want_to_meet": user_message})
+        guest["who_they_want_to_meet"] = user_message
+
+    elif current_stage == "interests" and len(user_message) > 5:
+        await supa_update("guests", {"phone": phone}, {"interests": user_message})
+        guest["interests"] = user_message
+
+    # Build messages for Claude
+    messages.append({"role": "user", "content": user_message})
+
+    system_prompt = build_onboarding_prompt(event, next_stage, guest)
+
+    # Get confirmed guests for personalization context
+    confirmed_guests = []
+    if next_stage == "generate_invite" and event:
+        confirmed_guests = await get_confirmed_guests(event.get("id", ""))
+
+    # Add confirmed guest context if generating invite
+    extra_context = ""
+    if next_stage == "generate_invite" and confirmed_guests:
+        guest_summaries = [f"- {g.get('name', 'Guest')}: {g.get('what_they_do', '')}" for g in confirmed_guests[:5]]
+        extra_context = f"\n\nCONFIRMED GUESTS SO FAR (use to personalize the invite):\n" + "\n".join(guest_summaries)
+        system_prompt += extra_context
+
+    # Call Claude
     response = anthropic_client.messages.create(
         model="claude-opus-4-5",
         max_tokens=500,
-        system=SONA_SYSTEM_PROMPT,
-        messages=session["messages"],
+        system=system_prompt,
+        messages=messages[-20:],  # Keep last 20 messages for context
     )
     reply = response.content[0].text
-    session["messages"].append({"role": "assistant", "content": reply})
+
+    # Save assistant reply
+    messages.append({"role": "assistant", "content": reply})
+
+    # Update RSVP status
+    if next_stage == "confirmed":
+        await supa_update("guests", {"phone": phone}, {
+            "rsvp_status": "confirmed",
+            "onboarding_complete": True,
+            "event_id": event.get("id") if event else None,
+        })
+    elif next_stage == "declined":
+        await supa_update("guests", {"phone": phone}, {"rsvp_status": "declined"})
+    elif next_stage == "generate_invite":
+        await supa_update("guests", {"phone": phone}, {"personalized_invite": reply})
+
+    # Save conversation state
+    await save_conversation(phone, messages, next_stage)
+
     return reply
-
-
-def send_whatsapp_message(to: str, body: str):
-    twilio_client.messages.create(
-        from_=TWILIO_WHATSAPP_NUMBER,
-        body=body,
-        to=to,
-    )
 
 
 # ── Gmail ─────────────────────────────────────────────────────────────────────
@@ -129,7 +389,7 @@ async def send_gmail(to: str, subject: str, body: str) -> dict:
     raise Exception(f"Gmail send failed: {resp.status_code} {resp.text}")
 
 
-# ── vendor ranking ────────────────────────────────────────────────────────────
+# ── Vendor ranking ─────────────────────────────────────────────────────────────
 def bayesian_score(rating: float, review_count: int, mean_rating: float, C: int = 50) -> float:
     return (C * mean_rating + rating * review_count) / (C + review_count)
 
@@ -152,66 +412,45 @@ def rank_vendors(vendors: list, search_params: dict) -> list:
     return sorted(vendors, key=lambda v: v["score"], reverse=True)
 
 
-# ── domain lists ──────────────────────────────────────────────────────────────
+# ── Email extraction ───────────────────────────────────────────────────────────
 EMAIL_PATTERN = re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b')
 
 IGNORE_DOMAINS = {
-    # Analytics & tracking
     "sentry.io", "mapquest.com", "doubleclick.net", "googletagmanager.com",
     "googleapis.com", "gstatic.com", "cloudflare.com", "akamai.com",
     "newrelic.com", "segment.com", "mixpanel.com", "amplitude.com",
     "intercom.io", "zendesk.com", "hubspot.com", "mailchimp.com",
-    # Website builders
     "wixpress.com", "squarespace.com", "wordpress.com", "shopify.com",
     "weebly.com", "webflow.io", "godaddy.com",
-    # Generic/placeholder
     "example.com", "yourdomain.com", "email.com", "domain.com",
     "yoursite.com", "company.com",
-    # Big providers
     "google.com", "gmail.com", "yahoo.com", "hotmail.com", "outlook.com",
     "icloud.com", "me.com", "mac.com", "live.com",
-    # Social/aggregators
     "yelp.com", "facebook.com", "instagram.com", "twitter.com",
     "tiktok.com", "linkedin.com", "pinterest.com",
     "doordash.com", "grubhub.com", "ubereats.com", "tripadvisor.com",
     "opentable.com", "resy.com", "thumbtack.com",
     "duckduckgo.com", "bing.com",
-    # Known false positive sources
     "giftly.com", "giggster.com", "heathercoros.com", "pandaexpressed.com",
     "escholarship.org", "partyslate.com",
-    # File extensions
     "png", "jpg", "jpeg", "gif", "webp", "svg", "pdf", "css", "js",
 }
 
-# Domains that are directories/aggregators — never use as a vendor's website
 DIRECTORY_DOMAINS = {
-    # Vendor directories & marketplaces
     "partyslate.com", "theknot.com", "weddingwire.com", "junebugweddings.com",
-    "stylemepretty.com", "greenweddingshoes.com", "borrowed-blu.com",
-    "thumbtack.com", "bark.com", "houzz.com", "expertise.com",
-    "gigsalad.com", "gigmasters.com", "eventsquid.com",
-    "styleseat.com", "vagaro.com", "booksy.com",
-    "eventective.com", "venuelook.com", "peerspace.com",
-    "tagvenue.com", "splacer.co", "breather.com",
-    # Review/listing sites
+    "stylemepretty.com", "thumbtack.com", "bark.com", "houzz.com", "expertise.com",
+    "gigsalad.com", "gigmasters.com", "styleseat.com", "vagaro.com", "booksy.com",
+    "eventective.com", "peerspace.com", "tagvenue.com",
     "yelp.com", "tripadvisor.com", "google.com", "bing.com",
     "yellowpages.com", "bbb.org", "manta.com", "zoominfo.com",
     "chamberofcommerce.com", "mapquest.com",
-    # Food delivery
-    "doordash.com", "grubhub.com", "ubereats.com", "postmates.com",
-    "caviar.com", "seamless.com", "toasttab.com",
-    # Social
-    "facebook.com", "instagram.com", "twitter.com", "linkedin.com",
-    "pinterest.com", "tiktok.com",
-    # Academic/misc
-    "escholarship.org", "academia.edu", "researchgate.net",
-    # Other known false positives
+    "doordash.com", "grubhub.com", "ubereats.com", "postmates.com", "toasttab.com",
+    "facebook.com", "instagram.com", "twitter.com", "linkedin.com", "pinterest.com", "tiktok.com",
+    "escholarship.org", "academia.edu",
     "giftly.com", "giggster.com", "heathercoros.com",
-    "unicorn-productions.us",  # This one was real — remove if needed
 }
 
-PRIORITY_LOCAL_PARTS = ["contact", "info", "hello", "events", "booking", "catering",
-                         "hire", "enquir", "inquir", "photo", "studio"]
+PRIORITY_LOCAL_PARTS = ["contact", "info", "hello", "events", "booking", "catering", "hire", "enquir", "inquir", "photo", "studio"]
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -221,7 +460,6 @@ HEADERS = {
 
 
 def is_directory_site(url: str) -> bool:
-    """Returns True if the URL belongs to a vendor directory or aggregator."""
     if not url:
         return False
     domain = urlparse(url).netloc.replace("www.", "")
@@ -233,16 +471,13 @@ def extract_emails_from_text(text: str) -> list:
     text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r'\[at\]|\(at\)| at ', '@', text, flags=re.IGNORECASE)
     text = re.sub(r'\[dot\]|\(dot\)| dot ', '.', text, flags=re.IGNORECASE)
-
     mailto = re.findall(r'mailto:([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})', text)
     plain = EMAIL_PATTERN.findall(text)
     all_emails = mailto + plain
-
     clean = []
     seen = set()
     for email in all_emails:
         email = email.lower().strip().rstrip(".,;")
-        # Strip www. from email domain
         parts = email.split("@")
         if len(parts) == 2 and parts[1].startswith("www."):
             email = parts[0] + "@" + parts[1][4:]
@@ -264,7 +499,6 @@ def extract_emails_from_text(text: str) -> list:
 
 
 def email_matches_website(email: str, website: str) -> bool:
-    """Email domain must match the vendor's confirmed website domain."""
     if not email or not website:
         return False
     email_domain = email.split("@")[-1].replace("www.", "")
@@ -273,7 +507,6 @@ def email_matches_website(email: str, website: str) -> bool:
 
 
 def is_valid_email(email: str, website: str | None) -> bool:
-    """Only accept emails whose domain matches the vendor's confirmed website."""
     if not email or not website:
         return False
     if is_directory_site(website):
@@ -282,7 +515,6 @@ def is_valid_email(email: str, website: str | None) -> bool:
 
 
 def get_website_from_results(results: list) -> str | None:
-    """Extract first non-directory, non-skipped website from search results."""
     for result in results:
         link = result.get("link", "")
         if link and not is_directory_site(link):
@@ -290,115 +522,7 @@ def get_website_from_results(results: list) -> str | None:
     return None
 
 
-# ── Apollo.io ─────────────────────────────────────────────────────────────────
-async def apollo_find_email(vendor_name: str, address: str) -> tuple:
-    if not APOLLO_API_KEY:
-        return None, None
-    city = address.split(",")[-2].strip() if "," in address else ""
-    state = address.split(",")[-1].strip().split()[0] if "," in address else ""
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                "https://api.apollo.io/v1/mixed_companies/search",
-                headers={"Content-Type": "application/json", "Cache-Control": "no-cache", "X-Api-Key": APOLLO_API_KEY},
-                json={
-                    "q_organization_name": vendor_name,
-                    "organization_locations": [f"{city}, {state}"] if city else [],
-                    "page": 1, "per_page": 3,
-                },
-            )
-            if resp.status_code in (403, 402):
-                return None, None
-            if resp.status_code != 200:
-                return None, None
-
-            organizations = resp.json().get("organizations", [])
-            if not organizations:
-                return None, None
-
-            best_org = None
-            for org in organizations:
-                org_name = org.get("name", "").lower()
-                vendor_words = [w for w in vendor_name.lower().split() if len(w) > 3]
-                if any(w in org_name for w in vendor_words):
-                    best_org = org
-                    break
-            if not best_org:
-                best_org = organizations[0]
-
-            website = best_org.get("website_url") or best_org.get("primary_domain")
-            if website and not website.startswith("http"):
-                website = f"https://{website}"
-            if website and is_directory_site(website):
-                website = None
-
-            email = None
-            if best_org.get("contact_emails"):
-                email = best_org["contact_emails"][0]
-
-            if not email and best_org.get("id"):
-                people_resp = await client.post(
-                    "https://api.apollo.io/v1/mixed_people/search",
-                    headers={"Content-Type": "application/json", "Cache-Control": "no-cache", "X-Api-Key": APOLLO_API_KEY},
-                    json={
-                        "organization_ids": [best_org["id"]],
-                        "page": 1, "per_page": 5,
-                        "person_titles": ["owner", "manager", "catering manager", "event coordinator", "director"],
-                    },
-                )
-                if people_resp.status_code == 200:
-                    for person in people_resp.json().get("people", []):
-                        person_email = person.get("email")
-                        if person_email and "@" in person_email and "apollo" not in person_email:
-                            email = person_email
-                            break
-
-            if email or website:
-                print(f"[apollo] {vendor_name} → email: {email}, website: {website}")
-            return email, website
-    except Exception as e:
-        print(f"[apollo error] {vendor_name}: {e}")
-        return None, None
-
-
-# ── Google Maps Places ────────────────────────────────────────────────────────
-async def google_maps_find_website(vendor_name: str, address: str) -> str | None:
-    if not GOOGLE_MAPS_API_KEY:
-        return None
-    try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            search_resp = await client.get(
-                "https://maps.googleapis.com/maps/api/place/textsearch/json",
-                params={"query": f"{vendor_name} {address}", "key": GOOGLE_MAPS_API_KEY},
-            )
-            if search_resp.status_code != 200:
-                return None
-            results = search_resp.json().get("results", [])
-            if not results:
-                return None
-            place_id = results[0].get("place_id")
-            if not place_id:
-                return None
-            details_resp = await client.get(
-                "https://maps.googleapis.com/maps/api/place/details/json",
-                params={"place_id": place_id, "fields": "website,name", "key": GOOGLE_MAPS_API_KEY},
-            )
-            if details_resp.status_code != 200:
-                return None
-            website = details_resp.json().get("result", {}).get("website")
-            if website:
-                website = website.rstrip("/")
-                if is_directory_site(website):
-                    print(f"[gmaps] {vendor_name}: rejected directory site {website}")
-                    return None
-                print(f"[gmaps] {vendor_name}: {website}")
-                return website
-    except Exception as e:
-        print(f"[gmaps error] {vendor_name}: {e}")
-    return None
-
-
-# ── SerpAPI ───────────────────────────────────────────────────────────────────
+# ── Search APIs ────────────────────────────────────────────────────────────────
 async def serp_search(query: str) -> dict:
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(
@@ -426,7 +550,95 @@ async def serp_yelp_search(vendor_name: str, city: str) -> dict:
     return {}
 
 
-# ── Hunter.io ─────────────────────────────────────────────────────────────────
+async def google_maps_find_website(vendor_name: str, address: str) -> str | None:
+    if not GOOGLE_MAPS_API_KEY:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            search_resp = await client.get(
+                "https://maps.googleapis.com/maps/api/place/textsearch/json",
+                params={"query": f"{vendor_name} {address}", "key": GOOGLE_MAPS_API_KEY},
+            )
+            if search_resp.status_code != 200:
+                return None
+            results = search_resp.json().get("results", [])
+            if not results:
+                return None
+            place_id = results[0].get("place_id")
+            if not place_id:
+                return None
+            details_resp = await client.get(
+                "https://maps.googleapis.com/maps/api/place/details/json",
+                params={"place_id": place_id, "fields": "website,name", "key": GOOGLE_MAPS_API_KEY},
+            )
+            if details_resp.status_code != 200:
+                return None
+            website = details_resp.json().get("result", {}).get("website")
+            if website:
+                website = website.rstrip("/")
+                if is_directory_site(website):
+                    return None
+                print(f"[gmaps] {vendor_name}: {website}")
+                return website
+    except Exception as e:
+        print(f"[gmaps error] {vendor_name}: {e}")
+    return None
+
+
+async def apollo_find_email(vendor_name: str, address: str) -> tuple:
+    if not APOLLO_API_KEY:
+        return None, None
+    city = address.split(",")[-2].strip() if "," in address else ""
+    state = address.split(",")[-1].strip().split()[0] if "," in address else ""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                "https://api.apollo.io/v1/mixed_companies/search",
+                headers={"Content-Type": "application/json", "Cache-Control": "no-cache", "X-Api-Key": APOLLO_API_KEY},
+                json={"q_organization_name": vendor_name, "organization_locations": [f"{city}, {state}"] if city else [], "page": 1, "per_page": 3},
+            )
+            if resp.status_code in (403, 402):
+                return None, None
+            if resp.status_code != 200:
+                return None, None
+            organizations = resp.json().get("organizations", [])
+            if not organizations:
+                return None, None
+            best_org = None
+            for org in organizations:
+                org_name = org.get("name", "").lower()
+                vendor_words = [w for w in vendor_name.lower().split() if len(w) > 3]
+                if any(w in org_name for w in vendor_words):
+                    best_org = org
+                    break
+            if not best_org:
+                best_org = organizations[0]
+            website = best_org.get("website_url") or best_org.get("primary_domain")
+            if website and not website.startswith("http"):
+                website = f"https://{website}"
+            if website and is_directory_site(website):
+                website = None
+            email = None
+            if best_org.get("contact_emails"):
+                email = best_org["contact_emails"][0]
+            if not email and best_org.get("id"):
+                people_resp = await client.post(
+                    "https://api.apollo.io/v1/mixed_people/search",
+                    headers={"Content-Type": "application/json", "Cache-Control": "no-cache", "X-Api-Key": APOLLO_API_KEY},
+                    json={"organization_ids": [best_org["id"]], "page": 1, "per_page": 5, "person_titles": ["owner", "manager", "catering manager", "event coordinator", "director"]},
+                )
+                if people_resp.status_code == 200:
+                    for person in people_resp.json().get("people", []):
+                        person_email = person.get("email")
+                        if person_email and "@" in person_email and "apollo" not in person_email:
+                            email = person_email
+                            break
+            return email, website
+    except Exception as e:
+        print(f"[apollo error] {vendor_name}: {e}")
+        return None, None
+
+
 async def hunter_find_email(domain: str) -> str | None:
     if not HUNTER_API_KEY or not domain:
         return None
@@ -485,27 +697,9 @@ async def scrape_email_from_website(website_url: str) -> str | None:
     return None
 
 
-# ── main email finder ─────────────────────────────────────────────────────────
 async def find_vendor_email(vendor_name: str, address: str) -> tuple:
-    """
-    Two-phase pipeline:
-
-    Phase 1 — Find the vendor's REAL website (not a directory):
-      1. Apollo.io
-      2. Google Maps Places API (rejects directory sites)
-      3. SerpAPI Yelp engine
-      4. SerpAPI Google (rejects directory sites)
-
-    Phase 2 — Find email from confirmed website only:
-      5. Scrape website pages
-      6. Hunter.io domain search
-      7. SerpAPI Google snippets (must match website domain)
-      8. DuckDuckGo (must match website domain)
-    """
     city = address.split(",")[-2].strip() if "," in address else ""
     website = None
-
-    # ── Phase 1: Find real website ────────────────────────────────────────────
 
     # 1. Apollo
     apollo_email, apollo_website = await apollo_find_email(vendor_name, address)
@@ -528,15 +722,12 @@ async def find_vendor_email(vendor_name: str, address: str) -> tuple:
                 candidate = result.get("website", "")
                 if candidate and not is_directory_site(candidate):
                     website = candidate.rstrip("/")
-                    print(f"[serp-yelp] {vendor_name} website: {website}")
                     break
 
-    # 4. SerpAPI Google for website
+    # 4. SerpAPI Google
     if not website:
         serp_site = await serp_search(f'"{vendor_name}" {city} official website')
         website = get_website_from_results(serp_site.get("organic_results", []))
-
-    # ── Phase 2: Find email from confirmed real website ───────────────────────
 
     if not website:
         print(f"[email] No real website found for {vendor_name}")
@@ -547,8 +738,6 @@ async def find_vendor_email(vendor_name: str, address: str) -> tuple:
     if email and is_valid_email(email, website):
         print(f"[scrape] {vendor_name}: {email}")
         return email, website
-    elif email:
-        print(f"[scrape-fail] {email} doesn't match {website}")
 
     # 6. Hunter.io
     domain = urlparse(website).netloc.replace("www.", "")
@@ -556,8 +745,6 @@ async def find_vendor_email(vendor_name: str, address: str) -> tuple:
         email = await hunter_find_email(domain)
         if email and is_valid_email(email, website):
             return email, website
-        elif email:
-            print(f"[hunter-fail] {email} doesn't match {website}")
 
     # 7. SerpAPI Google snippets
     serp_data = await serp_search(f'"{vendor_name}" {city} email contact')
@@ -566,8 +753,6 @@ async def find_vendor_email(vendor_name: str, address: str) -> tuple:
             if is_valid_email(email, website):
                 print(f"[serp-snippet] {vendor_name}: {email}")
                 return email, website
-            else:
-                print(f"[serp-snippet-fail] {email} rejected")
 
     # 8. DuckDuckGo
     try:
@@ -581,8 +766,6 @@ async def find_vendor_email(vendor_name: str, address: str) -> tuple:
                         if is_valid_email(email, website):
                             print(f"[ddg] {vendor_name}: {email}")
                             return email, website
-                        else:
-                            print(f"[ddg-fail] {email} rejected")
     except Exception as e:
         print(f"[ddg error] {e}")
 
@@ -590,20 +773,30 @@ async def find_vendor_email(vendor_name: str, address: str) -> tuple:
     return None, website
 
 
-# ── webhook ───────────────────────────────────────────────────────────────────
+def send_whatsapp_message(to: str, body: str):
+    twilio_client.messages.create(from_=TWILIO_WHATSAPP_NUMBER, body=body, to=to)
+
+
+# ── Webhook ────────────────────────────────────────────────────────────────────
 @app.post("/webhook", response_class=PlainTextResponse)
 async def webhook(From: str = Form(...), Body: str = Form(...)):
     phone = From
     user_message = Body.strip()
     print(f"[{phone}] → {user_message}")
-    reply = chat_with_sona(phone, user_message)
+
+    try:
+        reply = await handle_guest_onboarding(phone, user_message)
+    except Exception as e:
+        print(f"[webhook error] {e}")
+        reply = "Hey! Something went wrong on my end. Give me a moment and try again."
+
     print(f"[Sona → {phone}] {reply}")
     resp = MessagingResponse()
     resp.message(reply)
     return str(resp)
 
 
-# ── vendor search ─────────────────────────────────────────────────────────────
+# ── Vendor search ──────────────────────────────────────────────────────────────
 @app.post("/search-vendors")
 async def search_vendors(payload: dict):
     category = payload.get("category", "caterers")
@@ -669,11 +862,7 @@ async def search_vendors(payload: dict):
     if vendors:
         try:
             summary_prompt = f"""I'm looking for {category} for an event with {guest_count} guests, budget under ${budget}.
-Here are the top vendors: {json.dumps([{
-    "id": v["id"], "name": v["name"], "rating": v["rating"],
-    "review_count": v["review_count"], "price": v["price"],
-    "categories": v["categories"], "email": v.get("email")
-} for v in vendors[:5]], indent=2)}
+Here are the top vendors: {json.dumps([{"id": v["id"], "name": v["name"], "rating": v["rating"], "review_count": v["review_count"], "price": v["price"], "categories": v["categories"], "email": v.get("email")} for v in vendors[:5]], indent=2)}
 
 For each vendor write a 1-sentence reason why they're a good fit.
 Respond ONLY with a JSON array: [{{"id": "...", "reason": "..."}}]
@@ -694,12 +883,11 @@ No markdown, no explanation."""
         "vendors": vendors,
         "total": len(vendors),
         "emails_found": sum(1 for v in vendors if v.get("email")),
-        "query": {"category": category, "location": location, "budget": budget,
-                  "guest_count": guest_count, "min_rating": min_rating}
+        "query": {"category": category, "location": location, "budget": budget, "guest_count": guest_count, "min_rating": min_rating}
     }
 
 
-# ── send vendor email ─────────────────────────────────────────────────────────
+# ── Send vendor email ──────────────────────────────────────────────────────────
 @app.post("/send-vendor-email")
 async def send_vendor_email(payload: dict):
     to = payload.get("to")
@@ -713,14 +901,108 @@ async def send_vendor_email(payload: dict):
     try:
         result = await send_gmail(to, subject, body)
         print(f"[gmail] Sent to {vendor_name} <{to}>: {subject}")
-        return {"status": "sent", "to": to, "vendor_name": vendor_name,
-                "subject": subject, "message_id": result.get("message_id")}
+        return {"status": "sent", "to": to, "vendor_name": vendor_name, "subject": subject, "message_id": result.get("message_id")}
     except Exception as e:
         print(f"[gmail error] {e}")
         return {"error": str(e)}
 
 
-# ── debug email ───────────────────────────────────────────────────────────────
+# ── Guest API endpoints ────────────────────────────────────────────────────────
+@app.get("/guests")
+async def list_guests():
+    """Get all guests with their profiles — for the host dashboard."""
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/guests?order=created_at.desc",
+            headers=supa_headers(),
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    return []
+
+
+@app.get("/guests/{phone}")
+async def get_guest(phone: str):
+    rows = await supa_get("guests", {"phone": phone})
+    return rows[0] if rows else {"error": "not found"}
+
+
+@app.patch("/guests/{phone}")
+async def update_guest(phone: str, payload: dict):
+    result = await supa_update("guests", {"phone": phone}, payload)
+    return result or {"error": "update failed"}
+
+
+# ── Event API endpoints ────────────────────────────────────────────────────────
+@app.get("/events")
+async def list_events():
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/events?order=created_at.desc",
+            headers=supa_headers(),
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    return []
+
+
+@app.post("/events")
+async def create_event(payload: dict):
+    result = await supa_insert("events", payload)
+    return result or {"error": "create failed"}
+
+
+@app.patch("/events/{event_id}")
+async def update_event(event_id: str, payload: dict):
+    result = await supa_update("events", {"id": event_id}, payload)
+    return result or {"error": "update failed"}
+
+
+# ── Admin: send intro message ──────────────────────────────────────────────────
+@app.post("/admin/send-intro")
+async def send_intro(payload: dict):
+    """
+    Send the Sona intro message to a phone number to kick off onboarding.
+    POST: { "phone": "+13105551234", "from_name": "Joe" }
+    """
+    phone = payload.get("phone")
+    from_name = payload.get("from_name", "Joe")
+    if not phone:
+        return {"error": "phone required"}
+
+    # Format for WhatsApp
+    if not phone.startswith("whatsapp:"):
+        phone = f"whatsapp:{phone}"
+
+    intro_msg = f"Hey! I'm Sona, {from_name}'s AI concierge. He asked me to reach out about something exclusive he's putting together in LA. Before I tell you about it — what's your LinkedIn? Want to make sure this is the right fit for you."
+
+    send_whatsapp_message(phone, intro_msg)
+
+    # Initialize conversation in Supabase
+    await save_conversation(phone, [{"role": "assistant", "content": intro_msg}], "intro")
+
+    return {"status": "sent", "to": phone}
+
+
+@app.post("/admin/event-reminder")
+async def send_event_reminder(payload: dict):
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/guests?rsvp_status=eq.confirmed",
+            headers=supa_headers(),
+        )
+        confirmed = resp.json() if resp.status_code == 200 else []
+
+    phones = [g["phone"] for g in confirmed if g.get("phone")]
+    msg = f"🗓 Reminder: {payload.get('event_name', 'the event')} is happening {payload.get('date', 'soon')} at {payload.get('time', '')}! Come to {payload.get('location', '')}. See you there!"
+
+    for phone in phones:
+        send_whatsapp_message(phone, msg)
+
+    return {"status": "sent", "count": len(phones)}
+
+
+# ── Debug email endpoint ────────────────────────────────────────────────────────
 @app.post("/debug-email")
 async def debug_email(payload: dict):
     name = payload.get("name", "Rutt's Catering")
@@ -732,15 +1014,13 @@ async def debug_email(payload: dict):
         "serp_key_set": bool(SERP_API_KEY),
         "hunter_key_set": bool(HUNTER_API_KEY),
         "gmaps_key_set": bool(GOOGLE_MAPS_API_KEY),
+        "supabase_set": bool(SUPABASE_URL),
     }
 
     apollo_email, apollo_website = await apollo_find_email(name, address)
     results["apollo_email"] = apollo_email
     results["apollo_website"] = apollo_website
     results["google_maps_website"] = await google_maps_find_website(name, address)
-
-    yelp_data = await serp_yelp_search(name, city)
-    results["serp_yelp_results"] = len(yelp_data.get("organic_results", []))
 
     email, website = await find_vendor_email(name, address)
     results["final_email"] = email
@@ -749,36 +1029,18 @@ async def debug_email(payload: dict):
     return results
 
 
-# ── admin ─────────────────────────────────────────────────────────────────────
-@app.get("/admin/users")
-async def list_users():
-    return {phone: {"joined_at": d["joined_at"], "message_count": len(d["messages"]),
-                    "profile": d["profile"]} for phone, d in conversations.items()}
-
-
-@app.get("/admin/conversation/{phone_number}")
-async def get_conversation(phone_number: str):
-    return conversations.get(f"whatsapp:+{phone_number}", {"error": "not found"})
-
-
-@app.post("/admin/introduce")
-async def introduce_two_people(payload: dict):
-    phone_a = f"whatsapp:{payload['phone_a']}"
-    phone_b = f"whatsapp:{payload['phone_b']}"
-    send_whatsapp_message(phone_a, f"Hey! I have someone you should meet. {payload['name_b']} — {payload['reason']}. Tip: {payload['icebreaker']} 🎯")
-    send_whatsapp_message(phone_b, f"Hey! I want to introduce you to someone. {payload['name_a']} — {payload['reason']}. Tip: {payload['icebreaker']} 🎯")
-    return {"status": "sent", "to": [phone_a, phone_b]}
-
-
-@app.post("/admin/event-reminder")
-async def send_event_reminder(payload: dict):
-    phones = payload.get("phones") or [p.replace("whatsapp:", "") for p in conversations.keys()]
-    msg = f"🗓 Reminder: {payload['event_name']} is happening {payload['date']} at {payload['time']}! Come to {payload['location']}. See you there!"
-    for phone in phones:
-        send_whatsapp_message(f"whatsapp:{phone}", msg)
-    return {"status": "sent", "count": len(phones)}
-
-
+# ── Health ─────────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    return {"status": "ok", "users": len(conversations)}
+    guest_count = 0
+    try:
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            resp = await client.get(
+                f"{SUPABASE_URL}/rest/v1/guests?select=count",
+                headers={**supa_headers(), "Prefer": "count=exact"},
+            )
+            if resp.status_code == 200:
+                guest_count = int(resp.headers.get("content-range", "0/0").split("/")[-1])
+    except Exception:
+        pass
+    return {"status": "ok", "guests_in_db": guest_count}

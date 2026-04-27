@@ -11,7 +11,7 @@ import re
 import base64
 from datetime import datetime
 from statistics import mean
-from urllib.parse import quote_plus, unquote, urlparse
+from urllib.parse import quote_plus, unquote, urlparse, quote
 from email.mime.text import MIMEText
 
 app = FastAPI()
@@ -42,8 +42,10 @@ GMAIL_CLIENT_ID = os.environ.get("GMAIL_CLIENT_ID", "")
 GMAIL_CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET", "")
 GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN", "")
 GMAIL_SENDER = os.environ.get("GMAIL_SENDER", "yeh.joseph@gmail.com")
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+
+# Strip any whitespace/newlines from Supabase vars
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
 
 
 # ── Supabase helpers ──────────────────────────────────────────────────────────
@@ -57,12 +59,10 @@ def supa_headers():
 
 
 async def supa_get(table: str, filters: dict) -> list:
-    params = "&".join(f"{k}=eq.{v}" for k, v in filters.items())
+    params = "&".join(f"{k}=eq.{quote(str(v), safe='')}" for k, v in filters.items())
+    url = f"{SUPABASE_URL}/rest/v1/{table}?{params}"
     async with httpx.AsyncClient(timeout=8.0) as client:
-        resp = await client.get(
-            f"{SUPABASE_URL}/rest/v1/{table}?{params}",
-            headers=supa_headers(),
-        )
+        resp = await client.get(url, headers=supa_headers())
         if resp.status_code == 200:
             return resp.json()
     return []
@@ -82,7 +82,7 @@ async def supa_insert(table: str, data: dict) -> dict | None:
 
 
 async def supa_update(table: str, filters: dict, data: dict) -> dict | None:
-    params = "&".join(f"{k}=eq.{v}" for k, v in filters.items())
+    params = "&".join(f"{k}=eq.{quote(str(v), safe='')}" for k, v in filters.items())
     data["updated_at"] = datetime.now().isoformat()
     async with httpx.AsyncClient(timeout=8.0) as client:
         resp = await client.patch(
@@ -101,7 +101,7 @@ async def get_or_create_guest(phone: str) -> dict:
     if rows:
         return rows[0]
     new_guest = await supa_insert("guests", {"phone": phone})
-    return new_guest or {"phone": phone, "stage": "intro"}
+    return new_guest or {"phone": phone}
 
 
 async def get_or_create_conversation(phone: str) -> dict:
@@ -132,7 +132,6 @@ async def save_conversation(phone: str, messages: list, stage: str):
 
 
 async def get_active_event() -> dict | None:
-    """Get the most recently created event."""
     async with httpx.AsyncClient(timeout=8.0) as client:
         resp = await client.get(
             f"{SUPABASE_URL}/rest/v1/events?order=created_at.desc&limit=1",
@@ -206,25 +205,20 @@ RULES:
 - When they RSVP yes: confirm warmly, tell them the date/venue, say you'll send more details closer to the event
 - Do NOT mention you are an AI unless directly asked
 
-LINKEDIN EXTRACTION:
-When you receive a LinkedIn URL, acknowledge it and move to the next question. Do not try to look it up — the system will handle that separately.
-
 Respond naturally as Sona. No bullet points, no markdown. Just conversational text."""
 
 
-# ── Onboarding stage detection ─────────────────────────────────────────────────
+# ── Stage detection ────────────────────────────────────────────────────────────
 def detect_next_stage(current_stage: str, user_message: str, guest: dict) -> str:
-    """Advance the stage based on what we've collected."""
     msg_lower = user_message.lower().strip()
 
     if current_stage == "intro":
-        # Check if they gave us a LinkedIn URL
         if "linkedin.com" in msg_lower or "linked.in" in msg_lower:
             return "what_they_do"
         return "intro"
 
     if current_stage == "what_they_do":
-        if len(user_message) > 10:  # They answered
+        if len(user_message) > 10:
             return "who_to_meet"
         return "what_they_do"
 
@@ -239,7 +233,6 @@ def detect_next_stage(current_stage: str, user_message: str, guest: dict) -> str
         return "interests"
 
     if current_stage == "generate_invite":
-        # After generating invite, move to rsvp
         return "rsvp"
 
     if current_stage == "rsvp":
@@ -270,13 +263,8 @@ def extract_linkedin_url(text: str) -> str | None:
     return None
 
 
-# ── Main WhatsApp onboarding handler ─────────────────────────────────────────
+# ── Guest onboarding handler ───────────────────────────────────────────────────
 async def handle_guest_onboarding(phone: str, user_message: str) -> str:
-    """
-    Stateful onboarding conversation stored in Supabase.
-    Guides guest through 5 questions then generates personalized invite.
-    """
-    # Load state from Supabase
     conv = await get_or_create_conversation(phone)
     guest = await get_or_create_guest(phone)
     event = await get_active_event()
@@ -284,58 +272,41 @@ async def handle_guest_onboarding(phone: str, user_message: str) -> str:
     messages = conv.get("messages") or []
     current_stage = conv.get("stage") or "intro"
 
-    # Extract LinkedIn URL if present
     linkedin_url = extract_linkedin_url(user_message)
     if linkedin_url and not guest.get("linkedin_url"):
         await supa_update("guests", {"phone": phone}, {"linkedin_url": linkedin_url})
         guest["linkedin_url"] = linkedin_url
 
-    # Detect stage transitions and update guest data
     next_stage = detect_next_stage(current_stage, user_message, guest)
 
-    # Save answers to guest profile based on stage
     if current_stage == "what_they_do" and len(user_message) > 10:
         await supa_update("guests", {"phone": phone}, {"what_they_do": user_message})
         guest["what_they_do"] = user_message
-
     elif current_stage == "who_to_meet" and len(user_message) > 5:
         await supa_update("guests", {"phone": phone}, {"who_they_want_to_meet": user_message})
         guest["who_they_want_to_meet"] = user_message
-
     elif current_stage == "interests" and len(user_message) > 5:
         await supa_update("guests", {"phone": phone}, {"interests": user_message})
         guest["interests"] = user_message
 
-    # Build messages for Claude
     messages.append({"role": "user", "content": user_message})
-
     system_prompt = build_onboarding_prompt(event, next_stage, guest)
 
-    # Get confirmed guests for personalization context
-    confirmed_guests = []
     if next_stage == "generate_invite" and event:
         confirmed_guests = await get_confirmed_guests(event.get("id", ""))
+        if confirmed_guests:
+            guest_summaries = [f"- {g.get('name', 'Guest')}: {g.get('what_they_do', '')}" for g in confirmed_guests[:5]]
+            system_prompt += f"\n\nCONFIRMED GUESTS SO FAR:\n" + "\n".join(guest_summaries)
 
-    # Add confirmed guest context if generating invite
-    extra_context = ""
-    if next_stage == "generate_invite" and confirmed_guests:
-        guest_summaries = [f"- {g.get('name', 'Guest')}: {g.get('what_they_do', '')}" for g in confirmed_guests[:5]]
-        extra_context = f"\n\nCONFIRMED GUESTS SO FAR (use to personalize the invite):\n" + "\n".join(guest_summaries)
-        system_prompt += extra_context
-
-    # Call Claude
     response = anthropic_client.messages.create(
         model="claude-opus-4-5",
         max_tokens=500,
         system=system_prompt,
-        messages=messages[-20:],  # Keep last 20 messages for context
+        messages=messages[-20:],
     )
     reply = response.content[0].text
-
-    # Save assistant reply
     messages.append({"role": "assistant", "content": reply})
 
-    # Update RSVP status
     if next_stage == "confirmed":
         await supa_update("guests", {"phone": phone}, {
             "rsvp_status": "confirmed",
@@ -347,9 +318,7 @@ async def handle_guest_onboarding(phone: str, user_message: str) -> str:
     elif next_stage == "generate_invite":
         await supa_update("guests", {"phone": phone}, {"personalized_invite": reply})
 
-    # Save conversation state
     await save_conversation(phone, messages, next_stage)
-
     return reply
 
 
@@ -578,7 +547,6 @@ async def google_maps_find_website(vendor_name: str, address: str) -> str | None
                 website = website.rstrip("/")
                 if is_directory_site(website):
                     return None
-                print(f"[gmaps] {vendor_name}: {website}")
                 return website
     except Exception as e:
         print(f"[gmaps error] {vendor_name}: {e}")
@@ -672,7 +640,6 @@ async def hunter_find_email(domain: str) -> str | None:
             best = emails_sorted[0].get("value")
             if best and best.split("@")[-1] in IGNORE_DOMAINS:
                 return None
-            print(f"[hunter] {best} for {domain}")
             return best
     except Exception as e:
         print(f"[hunter error] {domain}: {e}")
@@ -701,18 +668,15 @@ async def find_vendor_email(vendor_name: str, address: str) -> tuple:
     city = address.split(",")[-2].strip() if "," in address else ""
     website = None
 
-    # 1. Apollo
     apollo_email, apollo_website = await apollo_find_email(vendor_name, address)
     if apollo_website and not is_directory_site(apollo_website):
         website = apollo_website
     if apollo_email and is_valid_email(apollo_email, website):
         return apollo_email, website
 
-    # 2. Google Maps
     if not website:
         website = await google_maps_find_website(vendor_name, address)
 
-    # 3. SerpAPI Yelp
     if not website:
         yelp_data = await serp_yelp_search(vendor_name, city)
         for result in yelp_data.get("organic_results", []):
@@ -724,37 +688,29 @@ async def find_vendor_email(vendor_name: str, address: str) -> tuple:
                     website = candidate.rstrip("/")
                     break
 
-    # 4. SerpAPI Google
     if not website:
         serp_site = await serp_search(f'"{vendor_name}" {city} official website')
         website = get_website_from_results(serp_site.get("organic_results", []))
 
     if not website:
-        print(f"[email] No real website found for {vendor_name}")
         return None, None
 
-    # 5. Scrape website
     email = await scrape_email_from_website(website)
     if email and is_valid_email(email, website):
-        print(f"[scrape] {vendor_name}: {email}")
         return email, website
 
-    # 6. Hunter.io
     domain = urlparse(website).netloc.replace("www.", "")
     if domain:
         email = await hunter_find_email(domain)
         if email and is_valid_email(email, website):
             return email, website
 
-    # 7. SerpAPI Google snippets
     serp_data = await serp_search(f'"{vendor_name}" {city} email contact')
     for result in serp_data.get("organic_results", []):
         for email in extract_emails_from_text(result.get("snippet", "") + " " + result.get("link", "")):
             if is_valid_email(email, website):
-                print(f"[serp-snippet] {vendor_name}: {email}")
                 return email, website
 
-    # 8. DuckDuckGo
     try:
         ddg_url = f"https://html.duckduckgo.com/html/?q={quote_plus(f'{vendor_name} {city} email contact')}"
         async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
@@ -764,12 +720,10 @@ async def find_vendor_email(vendor_name: str, address: str) -> tuple:
                 for snippet in snippets:
                     for email in extract_emails_from_text(re.sub(r'<[^>]+>', '', snippet)):
                         if is_valid_email(email, website):
-                            print(f"[ddg] {vendor_name}: {email}")
                             return email, website
     except Exception as e:
         print(f"[ddg error] {e}")
 
-    print(f"[email] No email found for {vendor_name} (website: {website})")
     return None, website
 
 
@@ -783,13 +737,11 @@ async def webhook(From: str = Form(...), Body: str = Form(...)):
     phone = From
     user_message = Body.strip()
     print(f"[{phone}] → {user_message}")
-
     try:
         reply = await handle_guest_onboarding(phone, user_message)
     except Exception as e:
         print(f"[webhook error] {e}")
         reply = "Hey! Something went wrong on my end. Give me a moment and try again."
-
     print(f"[Sona → {phone}] {reply}")
     resp = MessagingResponse()
     resp.message(reply)
@@ -806,7 +758,6 @@ async def search_vendors(payload: dict):
     min_rating = payload.get("min_rating", 4.0)
     keywords = payload.get("keywords", "")
     scrape_emails = payload.get("scrape_emails", True)
-
     search_term = f"{keywords} {category}".strip()
 
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -825,19 +776,13 @@ async def search_vendors(payload: dict):
     vendors = []
     for b in filtered:
         vendors.append({
-            "id": b.get("id"),
-            "name": b.get("name"),
-            "rating": b.get("rating"),
-            "review_count": b.get("review_count"),
-            "price": b.get("price", "N/A"),
+            "id": b.get("id"), "name": b.get("name"), "rating": b.get("rating"),
+            "review_count": b.get("review_count"), "price": b.get("price", "N/A"),
             "phone": b.get("display_phone", "N/A"),
             "address": ", ".join(b.get("location", {}).get("display_address", [])),
-            "url": b.get("url"),
-            "image_url": b.get("image_url"),
+            "url": b.get("url"), "image_url": b.get("image_url"),
             "categories": [c["title"] for c in b.get("categories", [])],
-            "coordinates": b.get("coordinates", {}),
-            "email": None,
-            "website": None,
+            "coordinates": b.get("coordinates", {}), "email": None, "website": None,
         })
 
     if scrape_emails and vendors:
@@ -863,13 +808,11 @@ async def search_vendors(payload: dict):
         try:
             summary_prompt = f"""I'm looking for {category} for an event with {guest_count} guests, budget under ${budget}.
 Here are the top vendors: {json.dumps([{"id": v["id"], "name": v["name"], "rating": v["rating"], "review_count": v["review_count"], "price": v["price"], "categories": v["categories"], "email": v.get("email")} for v in vendors[:5]], indent=2)}
-
 For each vendor write a 1-sentence reason why they're a good fit.
 Respond ONLY with a JSON array: [{{"id": "...", "reason": "..."}}]
 No markdown, no explanation."""
             claude_response = anthropic_client.messages.create(
-                model="claude-opus-4-5",
-                max_tokens=500,
+                model="claude-opus-4-5", max_tokens=500,
                 messages=[{"role": "user", "content": summary_prompt}],
             )
             rankings = json.loads(claude_response.content[0].text)
@@ -880,8 +823,7 @@ No markdown, no explanation."""
             pass
 
     return {
-        "vendors": vendors,
-        "total": len(vendors),
+        "vendors": vendors, "total": len(vendors),
         "emails_found": sum(1 for v in vendors if v.get("email")),
         "query": {"category": category, "location": location, "budget": budget, "guest_count": guest_count, "min_rating": min_rating}
     }
@@ -907,10 +849,9 @@ async def send_vendor_email(payload: dict):
         return {"error": str(e)}
 
 
-# ── Guest API endpoints ────────────────────────────────────────────────────────
+# ── Guest endpoints ────────────────────────────────────────────────────────────
 @app.get("/guests")
 async def list_guests():
-    """Get all guests with their profiles — for the host dashboard."""
     async with httpx.AsyncClient(timeout=8.0) as client:
         resp = await client.get(
             f"{SUPABASE_URL}/rest/v1/guests?order=created_at.desc",
@@ -933,7 +874,7 @@ async def update_guest(phone: str, payload: dict):
     return result or {"error": "update failed"}
 
 
-# ── Event API endpoints ────────────────────────────────────────────────────────
+# ── Event endpoints ────────────────────────────────────────────────────────────
 @app.get("/events")
 async def list_events():
     async with httpx.AsyncClient(timeout=8.0) as client:
@@ -958,29 +899,21 @@ async def update_event(event_id: str, payload: dict):
     return result or {"error": "update failed"}
 
 
-# ── Admin: send intro message ──────────────────────────────────────────────────
+# ── Admin endpoints ────────────────────────────────────────────────────────────
 @app.post("/admin/send-intro")
 async def send_intro(payload: dict):
-    """
-    Send the Sona intro message to a phone number to kick off onboarding.
-    POST: { "phone": "+13105551234", "from_name": "Joe" }
-    """
     phone = payload.get("phone")
     from_name = payload.get("from_name", "Joe")
     if not phone:
         return {"error": "phone required"}
 
-    # Format for WhatsApp
     if not phone.startswith("whatsapp:"):
         phone = f"whatsapp:{phone}"
 
     intro_msg = f"Hey! I'm Sona, {from_name}'s AI concierge. He asked me to reach out about something exclusive he's putting together in LA. Before I tell you about it — what's your LinkedIn? Want to make sure this is the right fit for you."
 
     send_whatsapp_message(phone, intro_msg)
-
-    # Initialize conversation in Supabase
     await save_conversation(phone, [{"role": "assistant", "content": intro_msg}], "intro")
-
     return {"status": "sent", "to": phone}
 
 
@@ -995,37 +928,41 @@ async def send_event_reminder(payload: dict):
 
     phones = [g["phone"] for g in confirmed if g.get("phone")]
     msg = f"🗓 Reminder: {payload.get('event_name', 'the event')} is happening {payload.get('date', 'soon')} at {payload.get('time', '')}! Come to {payload.get('location', '')}. See you there!"
-
     for phone in phones:
         send_whatsapp_message(phone, msg)
-
     return {"status": "sent", "count": len(phones)}
 
 
-# ── Debug email endpoint ────────────────────────────────────────────────────────
+# ── Debug endpoints ────────────────────────────────────────────────────────────
+@app.get("/debug-env")
+async def debug_env():
+    return {
+        "supabase_url_preview": SUPABASE_URL[:40] if SUPABASE_URL else "EMPTY",
+        "supabase_url_len": len(SUPABASE_URL),
+        "supabase_url_starts_with_https": SUPABASE_URL.startswith("https://"),
+        "supabase_service_key_set": bool(SUPABASE_SERVICE_KEY),
+        "supabase_service_key_len": len(SUPABASE_SERVICE_KEY),
+    }
+
+
 @app.post("/debug-email")
 async def debug_email(payload: dict):
     name = payload.get("name", "Rutt's Catering")
     address = payload.get("address", "Los Angeles, CA")
-    city = address.split(",")[-2].strip() if "," in address else ""
-
     results = {
+        "supabase_url": SUPABASE_URL[:30] if SUPABASE_URL else "EMPTY",
         "apollo_key_set": bool(APOLLO_API_KEY),
         "serp_key_set": bool(SERP_API_KEY),
         "hunter_key_set": bool(HUNTER_API_KEY),
         "gmaps_key_set": bool(GOOGLE_MAPS_API_KEY),
-        "supabase_set": bool(SUPABASE_URL),
     }
-
     apollo_email, apollo_website = await apollo_find_email(name, address)
     results["apollo_email"] = apollo_email
     results["apollo_website"] = apollo_website
     results["google_maps_website"] = await google_maps_find_website(name, address)
-
     email, website = await find_vendor_email(name, address)
     results["final_email"] = email
     results["final_website"] = website
-
     return results
 
 

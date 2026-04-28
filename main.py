@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Form, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from twilio.rest import Client
 from twilio.twiml.messaging_response import MessagingResponse
@@ -48,7 +48,6 @@ SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
 
 # ── Phone normalization ────────────────────────────────────────────────────────
 def normalize_phone(phone: str) -> str:
-    """Always store phone with whatsapp: prefix for consistency."""
     phone = phone.strip()
     if not phone.startswith("whatsapp:"):
         phone = f"whatsapp:{phone}"
@@ -59,10 +58,10 @@ def clean_message(text: str) -> str:
     """Strip any XML/TwiML wrapper that may have leaked into message content."""
     if not text:
         return text
-    # Strip full XML TwiML response if present
     text = re.sub(r'<\?xml[^>]*\?>', '', text)
-    text = re.sub(r'<Response>.*?</Response>', '', text, flags=re.DOTALL)
+    text = re.sub(r'</?Response>', '', text)
     text = re.sub(r'<Message>(.*?)</Message>', r'\1', text, flags=re.DOTALL)
+    text = re.sub(r'<[^>]+>', '', text)
     return text.strip()
 
 
@@ -96,6 +95,7 @@ async def supa_insert(table: str, data: dict) -> dict | None:
         if resp.status_code in (200, 201):
             result = resp.json()
             return result[0] if result else None
+        print(f"[supa_insert error] {resp.status_code}: {resp.text}")
     return None
 
 
@@ -111,6 +111,7 @@ async def supa_update(table: str, filters: dict, data: dict) -> dict | None:
         if resp.status_code == 200:
             result = resp.json()
             return result[0] if result else None
+        print(f"[supa_update error] {resp.status_code}: {resp.text}")
     return None
 
 
@@ -129,7 +130,10 @@ async def get_or_create_guest(phone: str) -> dict:
     if rows:
         return rows[0]
     new_guest = await supa_insert("guests", {"phone": phone})
-    return new_guest or {"phone": phone}
+    if new_guest:
+        return new_guest
+    print(f"[guest] Insert failed for {phone}, using in-memory fallback")
+    return {"phone": phone}
 
 
 async def get_or_create_conversation(phone: str) -> dict:
@@ -137,43 +141,25 @@ async def get_or_create_conversation(phone: str) -> dict:
     rows = await supa_get("conversations", {"phone": phone})
     if rows:
         conv = rows[0]
-        # Clean any corrupted XML from saved messages
         messages = conv.get("messages") or []
-        cleaned = []
-        for m in messages:
-            cleaned.append({
-                "role": m.get("role", "assistant"),
-                "content": clean_message(m.get("content", "")),
-            })
+        cleaned = [{"role": m.get("role", "assistant"), "content": clean_message(m.get("content", ""))} for m in messages]
         conv["messages"] = cleaned
         return conv
-    new_conv = await supa_insert("conversations", {
-        "phone": phone,
-        "messages": [],
-        "stage": "intro",
-    })
-    return new_conv or {"phone": phone, "messages": [], "stage": "intro"}
+    new_conv = await supa_insert("conversations", {"phone": phone, "messages": [], "stage": "intro"})
+    if new_conv:
+        return new_conv
+    print(f"[conv] Insert failed for {phone}, using in-memory fallback")
+    return {"phone": phone, "messages": [], "stage": "intro"}
 
 
 async def save_conversation(phone: str, messages: list, stage: str):
     phone = normalize_phone(phone)
-    # Clean messages before saving — never store XML
-    clean_messages = [
-        {"role": m["role"], "content": clean_message(m["content"])}
-        for m in messages
-    ]
+    clean_messages = [{"role": m["role"], "content": clean_message(m["content"])} for m in messages]
     rows = await supa_get("conversations", {"phone": phone})
     if rows:
-        await supa_update("conversations", {"phone": phone}, {
-            "messages": clean_messages,
-            "stage": stage,
-        })
+        await supa_update("conversations", {"phone": phone}, {"messages": clean_messages, "stage": stage})
     else:
-        await supa_insert("conversations", {
-            "phone": phone,
-            "messages": clean_messages,
-            "stage": stage,
-        })
+        await supa_insert("conversations", {"phone": phone, "messages": clean_messages, "stage": stage})
 
 
 async def get_active_event() -> dict | None:
@@ -218,31 +204,21 @@ def extract_linkedin_url(text: str) -> str | None:
 
 # ── Stage detection ────────────────────────────────────────────────────────────
 def detect_next_stage(current_stage: str, user_message: str, guest: dict, linkedin_found: bool) -> str:
-    """
-    Advance stage based on what we've collected.
-    Uses guest dict to check what's already saved — prevents re-asking.
-    """
     msg_lower = user_message.lower().strip()
 
     if current_stage == "intro":
-        # Only advance if LinkedIn URL found in this message
         return "what_they_do" if linkedin_found else "intro"
 
     if current_stage == "what_they_do":
-        # Only advance if they gave a real answer (not just a URL or very short reply)
         if len(user_message.strip()) > 10 and "linkedin" not in msg_lower:
             return "who_to_meet"
         return "what_they_do"
 
     if current_stage == "who_to_meet":
-        if len(user_message.strip()) > 3:
-            return "interests"
-        return "who_to_meet"
+        return "interests" if len(user_message.strip()) > 3 else "who_to_meet"
 
     if current_stage == "interests":
-        if len(user_message.strip()) > 3:
-            return "generate_invite"
-        return "interests"
+        return "generate_invite" if len(user_message.strip()) > 3 else "interests"
 
     if current_stage == "generate_invite":
         return "rsvp"
@@ -277,7 +253,7 @@ ACTIVE EVENT:
 """
 
     guest_info = f"""
-WHAT WE ALREADY KNOW ABOUT THIS GUEST (do NOT ask again):
+WHAT WE ALREADY KNOW (do NOT ask again):
 - LinkedIn: {guest.get('linkedin_url') or 'not yet provided'}
 - What they do: {guest.get('what_they_do') or 'not yet answered'}
 - Who they want to meet: {guest.get('who_they_want_to_meet') or 'not yet answered'}
@@ -286,17 +262,17 @@ WHAT WE ALREADY KNOW ABOUT THIS GUEST (do NOT ask again):
 """
 
     stage_instructions = {
-        "intro": "You already asked for their LinkedIn. Do NOT ask again. If they just gave you a LinkedIn URL, acknowledge it warmly and ask ONE question: what are they currently working on or building?",
-        "what_they_do": "You have their LinkedIn. Ask ONE question only: what are they currently working on or building right now?",
-        "who_to_meet": "You know what they do. Ask ONE question: who are they most hoping to connect with — other founders, investors, operators, potential customers?",
-        "interests": "You know who they want to meet. Ask ONE lightweight personal question — what do they do outside of work, or what have they been into lately?",
-        "generate_invite": "You now have everything you need. Write a compelling personalized 3-4 sentence invite. Be specific — reference exactly what they told you about their work and who they want to meet. Explain why this specific event is worth their Tuesday night. End with 'You in?'",
-        "rsvp": "They just read the invite. Handle their yes/no response naturally and warmly.",
-        "confirmed": "They said yes! Confirm their spot warmly. Give them the event date and venue. Tell them you'll send more details and who to look for closer to the event.",
+        "intro": "You just sent the intro. Wait for their LinkedIn URL. If they gave you one, acknowledge it and ask what they're working on. Do NOT ask for LinkedIn again if you already have it.",
+        "what_they_do": "You have their LinkedIn. Ask ONE question: what are they currently working on or building?",
+        "who_to_meet": "You know what they do. Ask ONE question: who are they most hoping to connect with?",
+        "interests": "Ask ONE lightweight personal question — what do they do outside of work?",
+        "generate_invite": "Write a compelling personalized 3-4 sentence invite. Reference exactly what they told you. End with 'You in?'",
+        "rsvp": "Handle their yes/no response warmly.",
+        "confirmed": "They said yes! Confirm their spot. Give date and venue. Say you'll send who to look for closer to the event.",
         "declined": "They said no. Be gracious. Tell them you'll keep them in mind for future events.",
     }
 
-    return f"""You are Sona, an AI concierge for an exclusive invite-only event community in Los Angeles, run by Joe Yeh and Eric Tsai.
+    return f"""You are Sona, an AI concierge for an exclusive invite-only event community in Los Angeles run by Joe Yeh and Eric Tsai.
 {event_info}
 {guest_info}
 CURRENT STAGE: {stage}
@@ -304,20 +280,19 @@ WHAT TO DO NOW: {stage_instructions.get(stage, 'Continue naturally.')}
 
 STRICT RULES:
 - ONE question per message maximum
-- SHORT messages — WhatsApp style, 2-3 sentences max
-- NEVER repeat a question already answered (check the guest info above)
+- SHORT messages — 2-3 sentences max, WhatsApp style
+- NEVER repeat a question already answered
 - NEVER ask for LinkedIn if you already have it
 - NEVER ask what they do if you already have it
-- Warm, human tone — not corporate or salesy
+- Warm, human tone
 - No bullet points, no markdown
-- Do not reveal you are an AI unless directly asked"""
+- Do not reveal you are an AI unless asked"""
 
 
 # ── Main onboarding handler ────────────────────────────────────────────────────
 async def handle_guest_onboarding(phone: str, user_message: str) -> str:
     phone = normalize_phone(phone)
 
-    # Load state from Supabase
     conv = await get_or_create_conversation(phone)
     guest = await get_or_create_guest(phone)
     event = await get_active_event()
@@ -325,19 +300,15 @@ async def handle_guest_onboarding(phone: str, user_message: str) -> str:
     messages = conv.get("messages") or []
     current_stage = conv.get("stage") or "intro"
 
-    # Extract LinkedIn URL once
     linkedin_url = extract_linkedin_url(user_message)
 
-    # Save LinkedIn if found and not already saved
     if linkedin_url and not guest.get("linkedin_url"):
         await supa_update("guests", {"phone": phone}, {"linkedin_url": linkedin_url})
         guest["linkedin_url"] = linkedin_url
         print(f"[linkedin] Saved for {phone}: {linkedin_url}")
 
-    # Determine next stage
     next_stage = detect_next_stage(current_stage, user_message, guest, bool(linkedin_url))
 
-    # Save answer based on completed stage
     if current_stage == "what_they_do" and len(user_message.strip()) > 10 and "linkedin" not in user_message.lower():
         await supa_update("guests", {"phone": phone}, {"what_they_do": user_message})
         guest["what_they_do"] = user_message
@@ -350,7 +321,6 @@ async def handle_guest_onboarding(phone: str, user_message: str) -> str:
         await supa_update("guests", {"phone": phone}, {"interests": user_message})
         guest["interests"] = user_message
 
-    # Build prompt with confirmed guests if generating invite
     system_prompt = build_onboarding_prompt(event, next_stage, guest)
     if next_stage == "generate_invite" and event:
         confirmed = await get_confirmed_guests(event.get("id", ""))
@@ -358,10 +328,8 @@ async def handle_guest_onboarding(phone: str, user_message: str) -> str:
             summaries = [f"- {g.get('name', 'Guest')}: {g.get('what_they_do', '')}" for g in confirmed[:5]]
             system_prompt += f"\n\nCONFIRMED GUESTS SO FAR:\n" + "\n".join(summaries)
 
-    # Add user message to history
     messages.append({"role": "user", "content": clean_message(user_message)})
 
-    # Call Claude — only send last 20 messages for context
     response = anthropic_client.messages.create(
         model="claude-opus-4-5",
         max_tokens=500,
@@ -371,7 +339,6 @@ async def handle_guest_onboarding(phone: str, user_message: str) -> str:
     reply = clean_message(response.content[0].text)
     messages.append({"role": "assistant", "content": reply})
 
-    # Update RSVP status
     if next_stage == "confirmed":
         await supa_update("guests", {"phone": phone}, {
             "rsvp_status": "confirmed",
@@ -383,9 +350,7 @@ async def handle_guest_onboarding(phone: str, user_message: str) -> str:
     elif next_stage == "generate_invite":
         await supa_update("guests", {"phone": phone}, {"personalized_invite": reply})
 
-    # Save clean conversation
     await save_conversation(phone, messages, next_stage)
-
     print(f"[stage] {phone}: {current_stage} → {next_stage}")
     return reply
 
@@ -798,8 +763,8 @@ def send_whatsapp_message(to: str, body: str):
     twilio_client.messages.create(from_=TWILIO_WHATSAPP_NUMBER, body=body, to=to)
 
 
-# ── Webhook ────────────────────────────────────────────────────────────────────
-@app.post("/webhook", response_class=PlainTextResponse)
+# ── Webhook — returns application/xml so Twilio parses TwiML correctly ─────────
+@app.post("/webhook")
 async def webhook(From: str = Form(...), Body: str = Form(...)):
     phone = From
     user_message = Body.strip()
@@ -814,7 +779,8 @@ async def webhook(From: str = Form(...), Body: str = Form(...)):
     print(f"[Sona → {phone}] {reply}")
     resp = MessagingResponse()
     resp.message(reply)
-    return str(resp)
+    # Return as application/xml — this is critical for Twilio to parse correctly
+    return Response(content=str(resp), media_type="application/xml")
 
 
 # ── Vendor search ──────────────────────────────────────────────────────────────
@@ -988,7 +954,6 @@ async def send_intro(payload: dict):
 
 @app.post("/admin/reset-conversation")
 async def reset_conversation(payload: dict):
-    """Reset a guest's conversation so they can go through onboarding again."""
     phone = normalize_phone(payload.get("phone", ""))
     if not phone:
         return {"error": "phone required"}

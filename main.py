@@ -42,8 +42,6 @@ GMAIL_CLIENT_ID = os.environ.get("GMAIL_CLIENT_ID", "")
 GMAIL_CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET", "")
 GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN", "")
 GMAIL_SENDER = os.environ.get("GMAIL_SENDER", "yeh.joseph@gmail.com")
-
-# Strip any whitespace/newlines from Supabase vars
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
 
@@ -154,99 +152,7 @@ async def get_confirmed_guests(event_id: str) -> list:
     return []
 
 
-# ── Sona onboarding system prompt ─────────────────────────────────────────────
-def build_onboarding_prompt(event: dict | None, stage: str, guest: dict) -> str:
-    event_info = ""
-    if event:
-        event_info = f"""
-ACTIVE EVENT:
-- Name: {event.get('name', 'An exclusive event')}
-- Date: {event.get('date', 'TBD')}
-- Venue: {event.get('venue', 'TBD')} in {event.get('city', 'Los Angeles')}
-- Expected guests: {event.get('guest_count', '~30')}
-- Vibe: {event.get('vibe', 'Intimate, curated networking')}
-- Audience: {event.get('audience', 'Asian tech founders and operators')}
-- Hosts: {event.get('host_name', 'Joe and Eric')}
-"""
-
-    guest_info = f"""
-GUEST SO FAR:
-- Name: {guest.get('name', 'unknown')}
-- LinkedIn: {guest.get('linkedin_url', 'not provided')}
-- What they do: {guest.get('what_they_do', 'unknown')}
-- Who they want to meet: {guest.get('who_they_want_to_meet', 'unknown')}
-- RSVP status: {guest.get('rsvp_status', 'pending')}
-"""
-
-    return f"""You are Sona, an AI concierge for an exclusive invite-only event community in Los Angeles run by Joe Yeh and Eric Tsai.
-
-Your job is to have a SHORT, warm, conversational intake with potential guests — figure out who they are and what they're looking for, then generate a personalized invite that makes them feel like this event was made for them.
-
-{event_info}
-{guest_info}
-
-CURRENT STAGE: {stage}
-
-ONBOARDING STAGES IN ORDER:
-1. intro — Warm greeting, explain you're reaching out on behalf of Joe. Ask for their LinkedIn URL first.
-2. what_they_do — Ask what they're working on / building right now (1 question only)
-3. who_to_meet — Ask who they're most trying to connect with (founders, investors, operators, talent, etc.)
-4. interests — Ask one lightweight personal question (what do you do outside of work, what are you into lately)
-5. generate_invite — Generate their personalized invite based on everything collected
-6. rsvp — They've seen the invite, handle yes/no/maybe response
-7. confirmed — They said yes, send event details and what to expect
-8. declined — They said no, be gracious
-
-RULES:
-- Ask ONE question at a time — never multiple questions in one message
-- Keep messages SHORT — this is WhatsApp, 2-4 sentences max
-- Be warm and human, not salesy or corporate
-- When generating the invite (stage 5): write a compelling 3-4 sentence personalized message that explains exactly why THIS person should come based on what they told you. Reference specific things they said. End with "You in?"
-- When they RSVP yes: confirm warmly, tell them the date/venue, say you'll send more details closer to the event
-- Do NOT mention you are an AI unless directly asked
-
-Respond naturally as Sona. No bullet points, no markdown. Just conversational text."""
-
-
-# ── Stage detection ────────────────────────────────────────────────────────────
-def detect_next_stage(current_stage: str, user_message: str, guest: dict) -> str:
-    msg_lower = user_message.lower().strip()
-
-    if current_stage == "intro":
-        if "linkedin.com" in msg_lower or "linked.in" in msg_lower:
-            return "what_they_do"
-        return "intro"
-
-    if current_stage == "what_they_do":
-        if len(user_message) > 10:
-            return "who_to_meet"
-        return "what_they_do"
-
-    if current_stage == "who_to_meet":
-        if len(user_message) > 5:
-            return "interests"
-        return "who_to_meet"
-
-    if current_stage == "interests":
-        if len(user_message) > 5:
-            return "generate_invite"
-        return "interests"
-
-    if current_stage == "generate_invite":
-        return "rsvp"
-
-    if current_stage == "rsvp":
-        yes_signals = ["yes", "yeah", "yep", "sure", "in", "absolutely", "definitely", "count me", "i'm in", "im in", "sounds good", "let's go", "lets go"]
-        no_signals = ["no", "nope", "can't", "cant", "won't", "wont", "pass", "not this time", "maybe next"]
-        if any(s in msg_lower for s in yes_signals):
-            return "confirmed"
-        if any(s in msg_lower for s in no_signals):
-            return "declined"
-        return "rsvp"
-
-    return current_stage
-
-
+# ── LinkedIn URL extraction ────────────────────────────────────────────────────
 def extract_linkedin_url(text: str) -> str | None:
     patterns = [
         r'https?://(?:www\.)?linkedin\.com/in/[\w\-]+/?',
@@ -263,8 +169,100 @@ def extract_linkedin_url(text: str) -> str | None:
     return None
 
 
-# ── Guest onboarding handler ───────────────────────────────────────────────────
+# ── Stage detection ────────────────────────────────────────────────────────────
+def detect_next_stage(current_stage: str, user_message: str, linkedin_found: bool) -> str:
+    """
+    Determine the next conversation stage based on current stage and user input.
+    linkedin_found is pre-computed so we don't re-run regex inside here.
+    """
+    msg_lower = user_message.lower().strip()
+
+    if current_stage == "intro":
+        # Only advance if we actually found a LinkedIn URL
+        return "what_they_do" if linkedin_found else "intro"
+
+    if current_stage == "what_they_do":
+        return "who_to_meet" if len(user_message) > 10 else "what_they_do"
+
+    if current_stage == "who_to_meet":
+        return "interests" if len(user_message) > 5 else "who_to_meet"
+
+    if current_stage == "interests":
+        return "generate_invite" if len(user_message) > 5 else "interests"
+
+    if current_stage == "generate_invite":
+        # After Claude generates the invite, move to rsvp
+        return "rsvp"
+
+    if current_stage == "rsvp":
+        yes_signals = ["yes", "yeah", "yep", "sure", "in", "absolutely", "definitely",
+                       "count me", "i'm in", "im in", "sounds good", "let's go", "lets go", "👍"]
+        no_signals = ["no", "nope", "can't", "cant", "won't", "wont", "pass",
+                      "not this time", "maybe next", "👎"]
+        if any(s in msg_lower for s in yes_signals):
+            return "confirmed"
+        if any(s in msg_lower for s in no_signals):
+            return "declined"
+        return "rsvp"
+
+    return current_stage
+
+
+# ── Onboarding system prompt ───────────────────────────────────────────────────
+def build_onboarding_prompt(event: dict | None, stage: str, guest: dict) -> str:
+    event_info = ""
+    if event:
+        event_info = f"""
+ACTIVE EVENT:
+- Name: {event.get('name', 'An exclusive event')}
+- Date: {event.get('date', 'TBD')}
+- Venue: {event.get('venue', 'TBD')} in {event.get('city', 'Los Angeles')}
+- Expected guests: {event.get('guest_count', '~30')}
+- Vibe: {event.get('vibe', 'Intimate, curated networking')}
+- Audience: {event.get('audience', 'Asian tech founders and operators')}
+- Hosts: {event.get('host_name', 'Joe and Eric')}
+"""
+
+    guest_info = f"""
+WHAT WE KNOW ABOUT THIS GUEST:
+- LinkedIn: {guest.get('linkedin_url', 'not yet provided')}
+- What they do: {guest.get('what_they_do', 'not yet answered')}
+- Who they want to meet: {guest.get('who_they_want_to_meet', 'not yet answered')}
+- Interests: {guest.get('interests', 'not yet answered')}
+- RSVP: {guest.get('rsvp_status', 'pending')}
+"""
+
+    stage_instructions = {
+        "intro": "You just sent the intro message asking for their LinkedIn. Wait for their response — do NOT ask for LinkedIn again. If they gave you a LinkedIn URL, acknowledge it warmly and ask what they're working on.",
+        "what_they_do": "You have their LinkedIn. Now ask ONE question: what are they working on or building right now?",
+        "who_to_meet": "You know what they do. Now ask ONE question: who are they most trying to connect with — founders, investors, operators, potential customers, talent?",
+        "interests": "You know who they want to meet. Ask ONE lightweight personal question — what do they do outside of work, or what have they been into lately?",
+        "generate_invite": "You now have everything. Write a compelling, personalized 3-4 sentence invite that references specific things they told you. Explain exactly why THIS event is worth their time. Be specific, not generic. End with 'You in?'",
+        "rsvp": "They've seen the invite. Handle their yes/no/maybe naturally. If yes, confirm warmly, give them the date and venue, and say you'll send more details closer to the event.",
+        "confirmed": "They said yes! Confirm their spot, give event details, tell them you'll be in touch with who to look for at the event.",
+        "declined": "They said no. Be gracious, tell them you'll keep them in mind for future events.",
+    }
+
+    return f"""You are Sona, an AI concierge for an exclusive invite-only event community in Los Angeles run by Joe Yeh and Eric Tsai.
+{event_info}
+{guest_info}
+
+CURRENT STAGE: {stage}
+YOUR INSTRUCTIONS FOR THIS STAGE: {stage_instructions.get(stage, 'Continue the conversation naturally.')}
+
+RULES:
+- Ask ONE question at a time maximum
+- Keep messages SHORT — WhatsApp style, 2-3 sentences max
+- Be warm and human, not corporate or salesy
+- Do NOT repeat questions already answered
+- Do NOT ask for LinkedIn again if you already have it
+- Do NOT mention you are an AI unless directly asked
+- No bullet points, no markdown, just conversational text"""
+
+
+# ── Main onboarding handler ────────────────────────────────────────────────────
 async def handle_guest_onboarding(phone: str, user_message: str) -> str:
+    # Load state
     conv = await get_or_create_conversation(phone)
     guest = await get_or_create_guest(phone)
     event = await get_active_event()
@@ -272,31 +270,41 @@ async def handle_guest_onboarding(phone: str, user_message: str) -> str:
     messages = conv.get("messages") or []
     current_stage = conv.get("stage") or "intro"
 
+    # Extract LinkedIn URL once — used for both stage detection and saving
     linkedin_url = extract_linkedin_url(user_message)
+
+    # Save LinkedIn URL if found and not already saved
     if linkedin_url and not guest.get("linkedin_url"):
         await supa_update("guests", {"phone": phone}, {"linkedin_url": linkedin_url})
         guest["linkedin_url"] = linkedin_url
+        print(f"[linkedin] Saved for {phone}: {linkedin_url}")
 
-    next_stage = detect_next_stage(current_stage, user_message, guest)
+    # Determine next stage — pass linkedin_found flag so detection is consistent
+    next_stage = detect_next_stage(current_stage, user_message, bool(linkedin_url))
 
+    # Save guest answers based on what stage we just completed
     if current_stage == "what_they_do" and len(user_message) > 10:
         await supa_update("guests", {"phone": phone}, {"what_they_do": user_message})
         guest["what_they_do"] = user_message
+
     elif current_stage == "who_to_meet" and len(user_message) > 5:
         await supa_update("guests", {"phone": phone}, {"who_they_want_to_meet": user_message})
         guest["who_they_want_to_meet"] = user_message
+
     elif current_stage == "interests" and len(user_message) > 5:
         await supa_update("guests", {"phone": phone}, {"interests": user_message})
         guest["interests"] = user_message
 
-    messages.append({"role": "user", "content": user_message})
+    # Add confirmed guests context when generating invite
     system_prompt = build_onboarding_prompt(event, next_stage, guest)
-
     if next_stage == "generate_invite" and event:
-        confirmed_guests = await get_confirmed_guests(event.get("id", ""))
-        if confirmed_guests:
-            guest_summaries = [f"- {g.get('name', 'Guest')}: {g.get('what_they_do', '')}" for g in confirmed_guests[:5]]
-            system_prompt += f"\n\nCONFIRMED GUESTS SO FAR:\n" + "\n".join(guest_summaries)
+        confirmed = await get_confirmed_guests(event.get("id", ""))
+        if confirmed:
+            summaries = [f"- {g.get('name', 'Guest')}: {g.get('what_they_do', '')}" for g in confirmed[:5]]
+            system_prompt += f"\n\nCONFIRMED GUESTS SO FAR (use to personalize):\n" + "\n".join(summaries)
+
+    # Build message history and call Claude
+    messages.append({"role": "user", "content": user_message})
 
     response = anthropic_client.messages.create(
         model="claude-opus-4-5",
@@ -307,6 +315,7 @@ async def handle_guest_onboarding(phone: str, user_message: str) -> str:
     reply = response.content[0].text
     messages.append({"role": "assistant", "content": reply})
 
+    # Update guest RSVP status
     if next_stage == "confirmed":
         await supa_update("guests", {"phone": phone}, {
             "rsvp_status": "confirmed",
@@ -318,7 +327,10 @@ async def handle_guest_onboarding(phone: str, user_message: str) -> str:
     elif next_stage == "generate_invite":
         await supa_update("guests", {"phone": phone}, {"personalized_invite": reply})
 
+    # Save conversation with advanced stage
     await save_conversation(phone, messages, next_stage)
+
+    print(f"[stage] {phone}: {current_stage} → {next_stage}")
     return reply
 
 
@@ -419,7 +431,8 @@ DIRECTORY_DOMAINS = {
     "giftly.com", "giggster.com", "heathercoros.com",
 }
 
-PRIORITY_LOCAL_PARTS = ["contact", "info", "hello", "events", "booking", "catering", "hire", "enquir", "inquir", "photo", "studio"]
+PRIORITY_LOCAL_PARTS = ["contact", "info", "hello", "events", "booking", "catering",
+                         "hire", "enquir", "inquir", "photo", "studio"]
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -593,7 +606,8 @@ async def apollo_find_email(vendor_name: str, address: str) -> tuple:
                 people_resp = await client.post(
                     "https://api.apollo.io/v1/mixed_people/search",
                     headers={"Content-Type": "application/json", "Cache-Control": "no-cache", "X-Api-Key": APOLLO_API_KEY},
-                    json={"organization_ids": [best_org["id"]], "page": 1, "per_page": 5, "person_titles": ["owner", "manager", "catering manager", "event coordinator", "director"]},
+                    json={"organization_ids": [best_org["id"]], "page": 1, "per_page": 5,
+                          "person_titles": ["owner", "manager", "catering manager", "event coordinator", "director"]},
                 )
                 if people_resp.status_code == 200:
                     for person in people_resp.json().get("people", []):
@@ -825,7 +839,8 @@ No markdown, no explanation."""
     return {
         "vendors": vendors, "total": len(vendors),
         "emails_found": sum(1 for v in vendors if v.get("email")),
-        "query": {"category": category, "location": location, "budget": budget, "guest_count": guest_count, "min_rating": min_rating}
+        "query": {"category": category, "location": location, "budget": budget,
+                  "guest_count": guest_count, "min_rating": min_rating}
     }
 
 
@@ -843,7 +858,8 @@ async def send_vendor_email(payload: dict):
     try:
         result = await send_gmail(to, subject, body)
         print(f"[gmail] Sent to {vendor_name} <{to}>: {subject}")
-        return {"status": "sent", "to": to, "vendor_name": vendor_name, "subject": subject, "message_id": result.get("message_id")}
+        return {"status": "sent", "to": to, "vendor_name": vendor_name,
+                "subject": subject, "message_id": result.get("message_id")}
     except Exception as e:
         print(f"[gmail error] {e}")
         return {"error": str(e)}
@@ -906,12 +922,9 @@ async def send_intro(payload: dict):
     from_name = payload.get("from_name", "Joe")
     if not phone:
         return {"error": "phone required"}
-
     if not phone.startswith("whatsapp:"):
         phone = f"whatsapp:{phone}"
-
     intro_msg = f"Hey! I'm Sona, {from_name}'s AI concierge. He asked me to reach out about something exclusive he's putting together in LA. Before I tell you about it — what's your LinkedIn? Want to make sure this is the right fit for you."
-
     send_whatsapp_message(phone, intro_msg)
     await save_conversation(phone, [{"role": "assistant", "content": intro_msg}], "intro")
     return {"status": "sent", "to": phone}
@@ -925,15 +938,14 @@ async def send_event_reminder(payload: dict):
             headers=supa_headers(),
         )
         confirmed = resp.json() if resp.status_code == 200 else []
-
     phones = [g["phone"] for g in confirmed if g.get("phone")]
-    msg = f"🗓 Reminder: {payload.get('event_name', 'the event')} is happening {payload.get('date', 'soon')} at {payload.get('time', '')}! Come to {payload.get('location', '')}. See you there!"
+    msg = f"🗓 Reminder: {payload.get('event_name', 'the event')} is happening {payload.get('date', 'soon')}! Come to {payload.get('location', '')}. See you there!"
     for phone in phones:
         send_whatsapp_message(phone, msg)
     return {"status": "sent", "count": len(phones)}
 
 
-# ── Debug endpoints ────────────────────────────────────────────────────────────
+# ── Debug / health ─────────────────────────────────────────────────────────────
 @app.get("/debug-env")
 async def debug_env():
     return {
@@ -966,7 +978,6 @@ async def debug_email(payload: dict):
     return results
 
 
-# ── Health ─────────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
     guest_count = 0

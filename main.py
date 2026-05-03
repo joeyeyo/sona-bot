@@ -44,6 +44,7 @@ GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN", "")
 GMAIL_SENDER = os.environ.get("GMAIL_SENDER", "yeh.joseph@gmail.com")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
+PROXYCURL_API_KEY = os.environ.get("PROXYCURL_API_KEY", "").strip()
 
 
 # ── Phone normalization ────────────────────────────────────────────────────────
@@ -306,6 +307,9 @@ async def handle_guest_onboarding(phone: str, user_message: str) -> str:
         await supa_update("guests", {"phone": phone}, {"linkedin_url": linkedin_url})
         guest["linkedin_url"] = linkedin_url
         print(f"[linkedin] Saved for {phone}: {linkedin_url}")
+        # Auto-enrich with NinjaPear in background (fire and forget)
+        import asyncio
+        asyncio.create_task(_enrich_and_save(phone, linkedin_url))
 
     next_stage = detect_next_stage(current_stage, user_message, guest, bool(linkedin_url))
 
@@ -763,6 +767,81 @@ def send_whatsapp_message(to: str, body: str):
     twilio_client.messages.create(from_=TWILIO_WHATSAPP_NUMBER, body=body, to=to)
 
 
+
+# ── NinjaPear LinkedIn enrichment ─────────────────────────────────────────────
+async def enrich_linkedin_profile(linkedin_url: str) -> dict | None:
+    """
+    Call NinjaPear (formerly Proxycurl) to get full LinkedIn profile data.
+    Returns structured dict or None if failed/unavailable.
+    """
+    if not PROXYCURL_API_KEY or not linkedin_url:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                "https://nubela.co/api/v1/employee/profile",
+                headers={"Authorization": f"Bearer {PROXYCURL_API_KEY}"},
+                params={"linkedin_url": linkedin_url},
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                # Normalize to our standard format
+                profile = {
+                    "full_name": data.get("full_name"),
+                    "headline": data.get("headline"),
+                    "current_role": data.get("occupation"),
+                    "current_company": (data.get("experiences") or [{}])[0].get("company") if data.get("experiences") else None,
+                    "location": data.get("city") or data.get("country_full_name"),
+                    "summary": data.get("summary"),
+                    "experiences": [
+                        {
+                            "title": e.get("title"),
+                            "company": e.get("company"),
+                            "duration": f"{e.get('starts_at', {}).get('year', '')} - {e.get('ends_at', {}).get('year', 'Present') if e.get('ends_at') else 'Present'}",
+                        }
+                        for e in (data.get("experiences") or [])
+                    ],
+                    "education": [
+                        {
+                            "school": e.get("school"),
+                            "degree": e.get("degree_name"),
+                            "field": e.get("field_of_study"),
+                        }
+                        for e in (data.get("education") or [])
+                    ],
+                    "skills": [s.get("name") for s in (data.get("skills") or []) if s.get("name")],
+                    "connection_count": data.get("connections"),
+                    "accomplishments": data.get("accomplishment_publications") or [],
+                }
+                print(f"[ninjapear] Enriched {linkedin_url}: {profile.get('full_name')}")
+                return profile
+            elif resp.status_code == 404:
+                print(f"[ninjapear] Profile not found: {linkedin_url}")
+            elif resp.status_code == 403:
+                print(f"[ninjapear] Out of credits")
+            else:
+                print(f"[ninjapear] Error {resp.status_code}: {resp.text[:200]}")
+    except Exception as e:
+        print(f"[ninjapear error] {e}")
+    return None
+
+
+async def _enrich_and_save(phone: str, linkedin_url: str):
+    """Background task: enrich LinkedIn profile and save to Supabase."""
+    try:
+        profile = await enrich_linkedin_profile(linkedin_url)
+        if profile and profile.get("full_name"):
+            await supa_update("guests", {"phone": phone}, {
+                "linkedin_data": profile,
+                "name": profile["full_name"],
+            })
+            print(f"[ninjapear] Saved profile for {phone}: {profile['full_name']}")
+        else:
+            print(f"[ninjapear] No profile data returned for {phone}")
+    except Exception as e:
+        print(f"[ninjapear background error] {e}")
+
+
 # ── Webhook — returns application/xml so Twilio parses TwiML correctly ─────────
 @app.post("/webhook")
 async def webhook(From: str = Form(...), Body: str = Form(...)):
@@ -961,6 +1040,29 @@ async def reset_conversation(payload: dict):
     await supa_delete("guests", {"phone": phone})
     return {"status": "reset", "phone": phone}
 
+
+
+@app.post("/admin/enrich-guest")
+async def enrich_guest_endpoint(payload: dict):
+    """
+    Enrich a guest's LinkedIn profile using NinjaPear.
+    Called from the dashboard scrape button.
+    POST: { "phone": "whatsapp:+1...", "linkedin_url": "https://linkedin.com/in/..." }
+    """
+    phone = normalize_phone(payload.get("phone", ""))
+    linkedin_url = payload.get("linkedin_url")
+    if not phone or not linkedin_url:
+        return {"error": "phone and linkedin_url required"}
+    if not PROXYCURL_API_KEY:
+        return {"error": "PROXYCURL_API_KEY not configured", "use_paste": True}
+    profile = await enrich_linkedin_profile(linkedin_url)
+    if not profile or not profile.get("full_name"):
+        return {"error": "Profile not found or private", "use_paste": True}
+    result = await supa_update("guests", {"phone": phone}, {
+        "linkedin_data": profile,
+        "name": profile["full_name"],
+    })
+    return {"status": "enriched", "name": profile["full_name"], "profile": profile}
 
 @app.post("/admin/event-reminder")
 async def send_event_reminder(payload: dict):

@@ -213,7 +213,7 @@ def detect_next_stage(current_stage: str, user_message: str, guest: dict, linked
 
     if current_stage == "what_they_do":
         # Advance on any real answer (2+ chars), unless it's a LinkedIn URL
-        if len(user_message.strip()) >= 2 and not linkedin_url:
+        if len(user_message.strip()) >= 2 and not linkedin_found:
             return "who_to_meet"
         return "what_they_do"
 

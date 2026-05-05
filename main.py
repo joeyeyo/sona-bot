@@ -229,15 +229,21 @@ def detect_next_stage(current_stage: str, user_message: str, guest: dict, linked
             return "generate_invite"
         return "interests"
 
+    yes_signals = ["yes", "yeah", "yep", "sure", "in", "absolutely", "definitely",
+                   "count me", "i'm in", "im in", "sounds good", "let's go", "lets go",
+                   "👍", "yea", "ok", "okay", "put me down", "add me", "i'm down", "im down"]
+    no_signals = ["no", "nope", "can't", "cant", "won't", "wont", "pass",
+                  "not this time", "maybe next", "👎", "not now", "skip"]
+
     if current_stage == "generate_invite":
+        # If user responds to the invite directly, detect yes/no immediately
+        if any(s in msg_lower for s in yes_signals):
+            return "confirmed"
+        if any(s in msg_lower for s in no_signals):
+            return "declined"
         return "rsvp"
 
     if current_stage == "rsvp":
-        yes_signals = ["yes", "yeah", "yep", "sure", "in", "absolutely", "definitely",
-                       "count me", "i'm in", "im in", "sounds good", "let's go", "lets go",
-                       "👍", "yea", "ok", "okay", "put me down", "add me", "i'm down", "im down"]
-        no_signals = ["no", "nope", "can't", "cant", "won't", "wont", "pass",
-                      "not this time", "maybe next", "👎", "not now", "skip"]
         if any(s in msg_lower for s in yes_signals):
             return "confirmed"
         if any(s in msg_lower for s in no_signals):
@@ -361,11 +367,17 @@ async def handle_guest_onboarding(phone: str, user_message: str) -> str:
     messages.append({"role": "assistant", "content": reply})
 
     if next_stage == "confirmed":
-        await supa_update("guests", {"phone": phone}, {
+        update_data = {
             "rsvp_status": "confirmed",
             "onboarding_complete": True,
             "event_id": event.get("id") if event else None,
-        })
+        }
+        # Try to extract name from Claude's reply (e.g. "Amazing, Joe!")
+        if not guest.get("name"):
+            name_match = re.search(r'(?:Amazing|Great|Thanks|Hey|Hi|Welcome),?\s+([A-Z][a-z]+)[\s!,.]', reply)
+            if name_match:
+                update_data["name"] = name_match.group(1)
+        await supa_update("guests", {"phone": phone}, update_data)
     elif next_stage == "declined":
         await supa_update("guests", {"phone": phone}, {"rsvp_status": "declined"})
     elif next_stage == "generate_invite":

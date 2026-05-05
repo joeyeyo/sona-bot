@@ -213,7 +213,7 @@ def detect_next_stage(current_stage: str, user_message: str, guest: dict, linked
 
     if current_stage == "what_they_do":
         # Advance on any real answer (2+ chars), unless it's a LinkedIn URL
-        if len(user_message.strip()) >= 2 and not linkedin_found:
+        if len(user_message.strip()) >= 2 and not linkedin_url:
             return "who_to_meet"
         return "what_they_do"
 
@@ -327,7 +327,7 @@ async def handle_guest_onboarding(phone: str, user_message: str) -> str:
     next_stage = detect_next_stage(current_stage, user_message, guest, bool(linkedin_url))
 
     # Save answers — only save when stage is actually that stage AND no LinkedIn URL in message
-    if current_stage == "what_they_do" and len(user_message.strip()) >= 2 and not linkedin_found:
+    if current_stage == "what_they_do" and len(user_message.strip()) >= 2 and not linkedin_url:
         await supa_update("guests", {"phone": phone}, {"what_they_do": user_message})
         guest["what_they_do"] = user_message
         print(f"[saved] what_they_do for {phone}: {user_message[:50]}")

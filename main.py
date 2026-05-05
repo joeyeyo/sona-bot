@@ -208,32 +208,45 @@ def detect_next_stage(current_stage: str, user_message: str, guest: dict, linked
     msg_lower = user_message.lower().strip()
 
     if current_stage == "intro":
+        # Only advance if LinkedIn URL was found
         return "what_they_do" if linkedin_found else "intro"
 
     if current_stage == "what_they_do":
-        if len(user_message.strip()) > 10 and "linkedin" not in msg_lower:
+        # Advance on any real answer (2+ chars), unless it's a LinkedIn URL
+        if len(user_message.strip()) >= 2 and not linkedin_found:
             return "who_to_meet"
         return "what_they_do"
 
     if current_stage == "who_to_meet":
-        return "interests" if len(user_message.strip()) > 3 else "who_to_meet"
+        # Advance on any real answer
+        if len(user_message.strip()) >= 2:
+            return "interests"
+        return "who_to_meet"
 
     if current_stage == "interests":
-        return "generate_invite" if len(user_message.strip()) > 3 else "interests"
+        # Advance on any real answer
+        if len(user_message.strip()) >= 2:
+            return "generate_invite"
+        return "interests"
 
     if current_stage == "generate_invite":
         return "rsvp"
 
     if current_stage == "rsvp":
         yes_signals = ["yes", "yeah", "yep", "sure", "in", "absolutely", "definitely",
-                       "count me", "i'm in", "im in", "sounds good", "let's go", "lets go", "👍", "yea"]
+                       "count me", "i'm in", "im in", "sounds good", "let's go", "lets go",
+                       "👍", "yea", "ok", "okay", "put me down", "add me", "i'm down", "im down"]
         no_signals = ["no", "nope", "can't", "cant", "won't", "wont", "pass",
-                      "not this time", "maybe next", "👎"]
+                      "not this time", "maybe next", "👎", "not now", "skip"]
         if any(s in msg_lower for s in yes_signals):
             return "confirmed"
         if any(s in msg_lower for s in no_signals):
             return "declined"
         return "rsvp"
+
+    # Already done stages — stay put
+    if current_stage in ("confirmed", "declined"):
+        return current_stage
 
     return current_stage
 
@@ -313,17 +326,21 @@ async def handle_guest_onboarding(phone: str, user_message: str) -> str:
 
     next_stage = detect_next_stage(current_stage, user_message, guest, bool(linkedin_url))
 
-    if current_stage == "what_they_do" and len(user_message.strip()) > 10 and "linkedin" not in user_message.lower():
+    # Save answers — only save when stage is actually that stage AND no LinkedIn URL in message
+    if current_stage == "what_they_do" and len(user_message.strip()) >= 2 and not linkedin_found:
         await supa_update("guests", {"phone": phone}, {"what_they_do": user_message})
         guest["what_they_do"] = user_message
+        print(f"[saved] what_they_do for {phone}: {user_message[:50]}")
 
-    elif current_stage == "who_to_meet" and len(user_message.strip()) > 3:
+    elif current_stage == "who_to_meet" and len(user_message.strip()) >= 2:
         await supa_update("guests", {"phone": phone}, {"who_they_want_to_meet": user_message})
         guest["who_they_want_to_meet"] = user_message
+        print(f"[saved] who_to_meet for {phone}: {user_message[:50]}")
 
-    elif current_stage == "interests" and len(user_message.strip()) > 3:
+    elif current_stage == "interests" and len(user_message.strip()) >= 2:
         await supa_update("guests", {"phone": phone}, {"interests": user_message})
         guest["interests"] = user_message
+        print(f"[saved] interests for {phone}: {user_message[:50]}")
 
     system_prompt = build_onboarding_prompt(event, next_stage, guest)
     if next_stage == "generate_invite" and event:
@@ -1077,6 +1094,47 @@ async def send_event_reminder(payload: dict):
     for phone in phones:
         send_whatsapp_message(phone, msg)
     return {"status": "sent", "count": len(phones)}
+
+
+
+# ── Test endpoints ────────────────────────────────────────────────────────────
+@app.post("/test/conversation")
+async def test_conversation(payload: dict):
+    """Simulate WhatsApp conversation without Twilio for testing."""
+    phone = payload.get("phone", "+15550001234")
+    message = payload.get("message", "")
+    if not message:
+        return {"error": "message required"}
+    phone_norm = normalize_phone(phone)
+    conv_before = await get_or_create_conversation(phone_norm)
+    stage_before = conv_before.get("stage", "intro")
+    reply = await handle_guest_onboarding(phone_norm, message)
+    conv_after = await get_or_create_conversation(phone_norm)
+    stage_after = conv_after.get("stage", "intro")
+    guest = await get_or_create_guest(phone_norm)
+    return {
+        "reply": reply,
+        "stage_before": stage_before,
+        "stage_after": stage_after,
+        "guest": {
+            "phone": guest.get("phone"),
+            "linkedin_url": guest.get("linkedin_url"),
+            "what_they_do": guest.get("what_they_do"),
+            "who_they_want_to_meet": guest.get("who_they_want_to_meet"),
+            "interests": guest.get("interests"),
+            "rsvp_status": guest.get("rsvp_status"),
+            "onboarding_complete": guest.get("onboarding_complete"),
+        }
+    }
+
+
+@app.post("/test/reset")
+async def test_reset(payload: dict):
+    """Reset a test phone. POST: {"phone": "+15550001234"}"""
+    phone = normalize_phone(payload.get("phone", "+15550001234"))
+    await supa_delete("conversations", {"phone": phone})
+    await supa_delete("guests", {"phone": phone})
+    return {"status": "reset", "phone": phone}
 
 
 # ── Debug / health ─────────────────────────────────────────────────────────────

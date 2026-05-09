@@ -1007,6 +1007,31 @@ async def list_guests():
     return []
 
 
+@app.post("/guests")
+async def create_guest_direct(payload: dict):
+    """Create a guest directly without WhatsApp onboarding. Used for test/manual data."""
+    phone = payload.get("phone", "").strip()
+    if not phone:
+        return {"error": "phone required"}
+    phone = normalize_phone(phone)
+    # Check if already exists
+    existing = await supa_get("guests", {"phone": phone})
+    if existing:
+        return {"error": f"Guest with phone {phone} already exists"}
+    data = {"phone": phone}
+    for field in ["name", "linkedin_url", "linkedin_data", "what_they_do",
+                  "who_they_want_to_meet", "interests", "rsvp_status",
+                  "onboarding_complete", "event_id"]:
+        if payload.get(field) is not None:
+            data[field] = payload[field]
+    result = await supa_insert("guests", data)
+    if result:
+        # Also create empty conversation
+        await supa_insert("conversations", {"phone": phone, "messages": [], "stage": "confirmed"})
+        return result
+    return {"error": "failed to create guest"}
+
+
 @app.get("/guests/{phone}")
 async def get_guest(phone: str):
     phone = normalize_phone(phone)

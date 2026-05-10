@@ -1085,6 +1085,17 @@ async def send_intro(payload: dict):
     return {"status": "sent", "to": phone}
 
 
+@app.post("/admin/send-message")
+async def send_message_to_guest(payload: dict):
+    """Send a WhatsApp message directly to a guest. Used for intros."""
+    phone = normalize_phone(payload.get("phone", ""))
+    message = payload.get("message", "")
+    if not phone or not message:
+        return {"error": "phone and message required"}
+    send_whatsapp_message(phone, message)
+    return {"status": "sent", "to": phone}
+
+
 @app.post("/admin/reset-conversation")
 async def reset_conversation(payload: dict):
     phone = normalize_phone(payload.get("phone", ""))

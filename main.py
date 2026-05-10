@@ -358,7 +358,7 @@ async def handle_guest_onboarding(phone: str, user_message: str) -> str:
     messages.append({"role": "user", "content": clean_message(user_message)})
 
     response = anthropic_client.messages.create(
-        model="claude-opus-4-5",
+        model="claude-haiku-4-5-20251001",
         max_tokens=500,
         system=system_prompt,
         messages=messages[-20:],
@@ -955,7 +955,7 @@ For each vendor write a 1-sentence reason why they're a good fit.
 Respond ONLY with a JSON array: [{{"id": "...", "reason": "..."}}]
 No markdown, no explanation."""
             claude_response = anthropic_client.messages.create(
-                model="claude-opus-4-5", max_tokens=500,
+                model="claude-haiku-4-5-20251001", max_tokens=500,
                 messages=[{"role": "user", "content": summary_prompt}],
             )
             rankings = json.loads(claude_response.content[0].text)

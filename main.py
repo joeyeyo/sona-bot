@@ -1070,7 +1070,7 @@ def extract_year(date_str: str) -> int | None:
     if not date_str:
         return None
     import re
-    years = re.findall(r'\b(19|20)\d{2}\b', str(date_str))
+    years = re.findall(r'\b(?:19|20)\d{2}\b', str(date_str))
     if not years:
         return None
     # Return the latest year found (graduation/end date)

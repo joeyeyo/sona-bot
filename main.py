@@ -1053,6 +1053,151 @@ async def get_guest(phone: str):
 
 
 
+
+# ── Age Estimator ─────────────────────────────────────────────────────────────
+CURRENT_YEAR = 2026
+UNDERGRAD_GRAD_AGE = 22
+
+DEGREE_EXTRA_YEARS = {
+    "phd": 4, "ph.d": 4, "doctor": 4,
+    "mba": 2, "master": 2, "ms": 2, "ma": 2, "m.s": 2, "m.a": 2,
+    "jd": 3, "j.d": 3, "law": 3,
+    "md": 4, "m.d": 4, "medicine": 4,
+}
+
+def extract_year(date_str: str) -> int | None:
+    """Extract a 4-digit year from a date string."""
+    if not date_str:
+        return None
+    import re
+    years = re.findall(r'\b(19|20)\d{2}\b', str(date_str))
+    if not years:
+        return None
+    # Return the latest year found (graduation/end date)
+    return max(int(y) for y in years)
+
+
+def classify_degree(degree_str: str) -> str:
+    """Classify degree type for extra years calculation."""
+    if not degree_str:
+        return "undergrad"
+    dl = degree_str.lower()
+    for key in DEGREE_EXTRA_YEARS:
+        if key in dl:
+            return key
+    # If no grad degree markers, assume undergrad
+    return "undergrad"
+
+
+def estimate_age_from_linkedin(linkedin_data: dict) -> tuple[int | None, str]:
+    """
+    Estimate age from LinkedIn data.
+    Returns (estimated_age, method_used) or (None, "insufficient_data")
+    
+    Strategy:
+    1. Find undergrad graduation year → age = CURRENT_YEAR - grad_year + 22
+    2. Fallback: Find first non-internship job year → age = CURRENT_YEAR - job_year + 22
+    3. If only grad degree: add degree-specific years to undergrad estimate
+    """
+    education = linkedin_data.get("education") or []
+    experiences = linkedin_data.get("experiences") or []
+
+    # ── Strategy 1: Find undergrad graduation year ─────────────────────────
+    undergrad_grad_year = None
+    grad_degree_year = None
+    grad_degree_type = "undergrad"
+
+    for edu in education:
+        dates = edu.get("dates") or edu.get("description") or ""
+        degree = edu.get("degree") or ""
+        degree_type = classify_degree(degree)
+
+        year = extract_year(dates)
+        if not year:
+            continue
+
+        if degree_type == "undergrad":
+            # Take earliest undergrad (some people list exchange programs)
+            if undergrad_grad_year is None or year < undergrad_grad_year:
+                undergrad_grad_year = year
+        else:
+            # Grad degree — take earliest
+            if grad_degree_year is None or year < grad_degree_year:
+                grad_degree_year = year
+                grad_degree_type = degree_type
+
+    if undergrad_grad_year:
+        age = CURRENT_YEAR - undergrad_grad_year + UNDERGRAD_GRAD_AGE
+        if 18 <= age <= 80:
+            return age, f"undergrad graduation year {undergrad_grad_year}"
+
+    # ── Strategy 1b: Grad degree only — subtract extra years ──────────────
+    if grad_degree_year and not undergrad_grad_year:
+        extra = DEGREE_EXTRA_YEARS.get(grad_degree_type, 2)
+        # Grad degree year = undergrad year + extra years + 22
+        # So: age = CURRENT_YEAR - grad_degree_year + 22 + extra
+        age = CURRENT_YEAR - grad_degree_year + UNDERGRAD_GRAD_AGE + extra
+        if 18 <= age <= 80:
+            return age, f"{grad_degree_type} graduation year {grad_degree_year} (+{extra}yr adjustment)"
+
+    # ── Strategy 2: First non-internship job year ──────────────────────────
+    INTERNSHIP_KEYWORDS = ["intern", "internship", "summer", "part time", "part-time", "assistant"]
+
+    job_years = []
+    for exp in experiences:
+        title = (exp.get("title") or "").lower()
+        employment_type = (exp.get("employment_type") or exp.get("type") or "").lower()
+        dates = exp.get("dates") or ""
+
+        # Skip internships
+        if any(kw in title for kw in INTERNSHIP_KEYWORDS):
+            continue
+        if "intern" in employment_type:
+            continue
+
+        year = extract_year(dates)
+        if year and 1990 <= year <= CURRENT_YEAR:
+            job_years.append(year)
+
+    if job_years:
+        first_job_year = min(job_years)
+        age = CURRENT_YEAR - first_job_year + UNDERGRAD_GRAD_AGE
+        if 18 <= age <= 80:
+            return age, f"first job year {first_job_year}"
+
+    return None, "insufficient_data"
+
+
+@app.post("/guests/estimate-age/{phone}")
+async def estimate_guest_age(phone: str):
+    """Estimate age from LinkedIn data and save to guest record."""
+    phone = normalize_phone(phone)
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/guests?phone=eq.{quote(phone)}&limit=1",
+            headers=supa_headers(),
+        )
+        if resp.status_code != 200 or not resp.json():
+            return {"error": "Guest not found"}
+        guest = resp.json()[0]
+
+    linkedin_data = guest.get("linkedin_data")
+    if not linkedin_data:
+        return {"error": "No LinkedIn data available", "age": None}
+
+    age, method = estimate_age_from_linkedin(linkedin_data)
+
+    if age is None:
+        return {"error": "Insufficient LinkedIn data to estimate age", "method": method, "age": None}
+
+    # Save to guest record
+    await supa_update("guests", {"phone": phone}, {
+        "age": age,
+        "age_estimated": True,
+    })
+
+    return {"age": age, "estimated": True, "method": method}
+
 # ── Scoring Engine ────────────────────────────────────────────────────────────
 async def get_active_scoring_prompt() -> tuple[str, int]:
     """Fetch the active scoring prompt and version from Supabase."""

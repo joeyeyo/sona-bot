@@ -1032,6 +1032,19 @@ async def create_guest_direct(payload: dict):
     return {"error": "failed to create guest"}
 
 
+@app.get("/guests/scores")
+async def get_all_guest_scores():
+    """Get all guest scores for the dashboard."""
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/guest_scores?order=success_score.desc",
+            headers=supa_headers(),
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    return []
+
+
 @app.get("/guests/{phone}")
 async def get_guest(phone: str):
     phone = normalize_phone(phone)
@@ -1039,11 +1052,225 @@ async def get_guest(phone: str):
     return rows[0] if rows else {"error": "not found"}
 
 
+
+# ── Scoring Engine ────────────────────────────────────────────────────────────
+async def get_active_scoring_prompt() -> tuple[str, int]:
+    """Fetch the active scoring prompt and version from Supabase."""
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/scoring_config?is_active=eq.true&order=version.desc&limit=1",
+            headers=supa_headers(),
+        )
+        if resp.status_code == 200 and resp.json():
+            config = resp.json()[0]
+            return config["prompt"], config["version"]
+    return None, None
+
+
+async def get_calibration_examples(limit: int = 5) -> str:
+    """Fetch recent score overrides to use as calibration examples."""
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/score_overrides?order=created_at.desc&limit={limit}",
+            headers=supa_headers(),
+        )
+        if resp.status_code == 200 and resp.json():
+            overrides = resp.json()
+            if not overrides:
+                return "No calibration examples yet."
+            lines = []
+            for o in overrides:
+                lines.append(
+                    f"- {o.get('guest_name', 'Unknown')}: {o.get('dimension')} "
+                    f"changed {o.get('score_before')} → {o.get('score_after')} "
+                    f"because: {o.get('reason', 'no reason given')} "
+                    f"[category: {o.get('reason_category', 'uncategorized')}]"
+                )
+            return "\n".join(lines)
+    return "No calibration examples yet."
+
+
+async def score_guest_profile(phone: str, guest: dict) -> dict | None:
+    """Run the scoring algorithm on a guest using the active prompt version."""
+    prompt_template, prompt_version = await get_active_scoring_prompt()
+    if not prompt_template:
+        print(f"[scoring] No active prompt found — skipping scoring for {phone}")
+        return None
+
+    ld = guest.get("linkedin_data") or {}
+    calibration = await get_calibration_examples()
+
+    experiences_text = ""
+    for exp in (ld.get("experiences") or [])[:5]:
+        experiences_text += f"  - {exp.get('title')} at {exp.get('company')} ({exp.get('dates', '')})\n"
+        if exp.get("description"):
+            experiences_text += f"    {exp['description'][:200]}\n"
+
+    education_text = ""
+    for edu in (ld.get("education") or []):
+        education_text += f"  - {edu.get('school')} — {edu.get('degree', '')} {edu.get('field', '')}\n"
+
+    honors_text = ", ".join(ld.get("honors") or []) or "None listed"
+
+    prompt = prompt_template.format(
+        calibration_examples=calibration,
+        name=ld.get("full_name") or guest.get("name") or "Unknown",
+        headline=ld.get("headline") or "",
+        current_role=ld.get("current_role") or "",
+        current_company=ld.get("current_company") or "",
+        summary=(ld.get("summary") or "")[:500],
+        experiences=experiences_text,
+        education=education_text,
+        honors=honors_text,
+        skills=", ".join((ld.get("skills") or [])[:15]),
+        what_they_do=guest.get("what_they_do") or "",
+        who_they_want_to_meet=guest.get("who_they_want_to_meet") or "",
+        interests=guest.get("interests") or "",
+    )
+
+    try:
+        response = anthropic_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = response.content[0].text
+        clean = re.sub(r"```json|```", "", text).strip()
+        match = re.search(r"\{[\s\S]+\}", clean)
+        if not match:
+            print(f"[scoring] No JSON in response for {phone}")
+            return None
+        scores = json.loads(match.group())
+
+        # Calculate success_score from weights if not provided
+        if "success_score" not in scores:
+            weights = {"pedigree_score": 0.15, "accomplishment_score": 0.25,
+                       "credibility_score": 0.20, "value_to_others": 0.10, "company_score": 0.30}
+            scores["success_score"] = round(sum(
+                scores.get(k, 0) * w for k, w in weights.items()
+            ))
+
+        # Save to guest_scores
+        score_data = {
+            "phone": phone,
+            "credibility_score": scores.get("credibility_score"),
+            "credibility_for_goal": scores.get("credibility_reasoning"),
+            "value_to_others": scores.get("value_to_others"),
+            "value_explanation": scores.get("value_reasoning"),
+            "stage": scores.get("stage"),
+            "goal_specificity": None,
+            "success_score": scores.get("success_score"),
+            "pedigree_score": scores.get("pedigree_score"),
+            "accomplishment_score": scores.get("accomplishment_score"),
+            "company_score": scores.get("company_score"),
+            "ownership_stake": scores.get("ownership_stake"),
+            "defensibility": scores.get("defensibility"),
+            "growth_signal": scores.get("growth_signal"),
+            "market_position": scores.get("market_position"),
+            "score_breakdown": json.dumps({
+                "pedigree_reasoning": scores.get("pedigree_reasoning"),
+                "accomplishment_reasoning": scores.get("accomplishment_reasoning"),
+                "credibility_reasoning": scores.get("credibility_reasoning"),
+                "value_reasoning": scores.get("value_reasoning"),
+                "company_reasoning": scores.get("company_reasoning"),
+                "key_insight": scores.get("key_insight"),
+                "prompt_version": prompt_version,
+            }),
+        }
+
+        # Upsert into guest_scores
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            upsert_resp = await client.post(
+                f"{SUPABASE_URL}/rest/v1/guest_scores",
+                headers={**supa_headers(), "Prefer": "resolution=merge-duplicates"},
+                json=score_data,
+            )
+            if upsert_resp.status_code in (200, 201):
+                print(f"[scoring] ✓ Scored {guest.get('name') or phone}: success={scores.get('success_score')}")
+            else:
+                print(f"[scoring] Save failed: {upsert_resp.status_code} {upsert_resp.text}")
+
+        # Log the scoring run
+        await supa_insert("scoring_runs", {
+            "phone": phone,
+            "prompt_version": prompt_version,
+            "scores": scores,
+            "raw_claude_response": text[:2000],
+        })
+
+        return scores
+
+    except Exception as e:
+        print(f"[scoring] Error scoring {phone}: {e}")
+        return None
+
+
 @app.patch("/guests/{phone}")
 async def update_guest(phone: str, payload: dict):
     phone = normalize_phone(phone)
     result = await supa_update("guests", {"phone": phone}, payload)
+    # Auto-score if linkedin_data was just imported
+    if payload.get("linkedin_data") and result:
+        guest = result if isinstance(result, dict) else payload
+        guest["phone"] = phone
+        import asyncio
+        asyncio.create_task(score_guest_profile(phone, guest))
+        print(f"[scoring] Auto-scoring triggered for {phone}")
     return result or {"error": "update failed"}
+
+
+@app.post("/guests/score/{phone}")
+async def score_guest_endpoint(phone: str):
+    """Manually trigger scoring for a guest."""
+    phone = normalize_phone(phone)
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/guests?phone=eq.{quote(phone)}&limit=1",
+            headers=supa_headers(),
+        )
+        if resp.status_code != 200 or not resp.json():
+            return {"error": "Guest not found"}
+        guest = resp.json()[0]
+    scores = await score_guest_profile(phone, guest)
+    return scores or {"error": "Scoring failed"}
+
+
+@app.post("/guests/score-all")
+async def score_all_guests():
+    """Score all guests who have linkedin_data."""
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/guests?linkedin_data=not.is.null",
+            headers=supa_headers(),
+        )
+        if resp.status_code != 200:
+            return {"error": "Failed to fetch guests"}
+        guests = resp.json()
+    results = []
+    for guest in guests:
+        scores = await score_guest_profile(guest["phone"], guest)
+        results.append({"phone": guest["phone"], "success": scores is not None})
+    return {"scored": len(results), "results": results}
+
+
+@app.post("/scoring/override")
+async def save_score_override(payload: dict):
+    """Log a score override — your feedback that improves future scoring."""
+    result = await supa_insert("score_overrides", {
+        "phone": payload.get("phone"),
+        "guest_name": payload.get("guest_name"),
+        "dimension": payload.get("dimension"),
+        "score_before": payload.get("score_before"),
+        "score_after": payload.get("score_after"),
+        "reason": payload.get("reason"),
+        "reason_category": payload.get("reason_category"),
+        "prompt_version": payload.get("prompt_version", 1),
+    })
+    # Also update the actual score in guest_scores
+    if payload.get("dimension") and payload.get("score_after") is not None:
+        await supa_update("guest_scores", {"phone": payload.get("phone")},
+                          {payload.get("dimension"): payload.get("score_after")})
+    return result or {"error": "failed"}
 
 
 # ── Event endpoints ────────────────────────────────────────────────────────────
